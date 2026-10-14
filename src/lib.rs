@@ -1,0 +1,10 @@
+pub mod bot;
+pub mod classifier;
+pub mod config;
+pub mod db;
+pub mod delivery;
+pub mod downloads;
+pub mod immich;
+pub mod media;
+pub mod notifications;
+pub mod scanner;

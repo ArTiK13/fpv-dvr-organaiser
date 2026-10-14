@@ -1,0 +1,8 @@
+# Merge into the EXISTING official Immich stack (copy to its compose.override.yml).
+# Do not mount the FPV directory at UPLOAD_LOCATION: it is an external library.
+services:
+  immich-server:
+    volumes:
+      - ${FPV_VIDEO_ROOT:?set FPV_VIDEO_ROOT}:/mnt/fpv:ro
+  # If your Immich deployment has a separate worker/microservices container,
+  # mount exactly the same read-only path in that container too.

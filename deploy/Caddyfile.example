@@ -1,0 +1,10 @@
+# Substitute your DNS names and LAN upstreams. This file does not modify
+# an existing proxy. Immich remains an independent stack on the same server.
+photos.example.com {
+    reverse_proxy 127.0.0.1:2283
+}
+fpv.example.com {
+    @download path /download/*
+    reverse_proxy @download 127.0.0.1:8080
+    respond 404
+}

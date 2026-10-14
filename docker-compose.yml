@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fpv
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: fpv
+    volumes:
+      - fpv-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fpv -d fpv"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  fpv-catalog:
+    build: .
+    env_file: .env
+    environment:
+      VIDEO_ROOT: /srv/fpv/sorted
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${VIDEO_ROOT:?set VIDEO_ROOT}:/srv/fpv/sorted:ro
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+volumes:
+  fpv-postgres:
