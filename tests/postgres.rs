@@ -189,7 +189,7 @@ async fn catalog_lifecycle_permissions_links_and_notifications() -> Result<()> {
         std::fs::copy(&movie, f.join("v.mp4"))?;
     }
     assert_eq!(scanner::scan_once(&p, &c).await?, 3);
-    let (_, _, visible) = db::search(&p, &u, &Filters::default()).await?;
+    let visible = db::search(&p, &u, &Filters::default()).await?.videos;
     assert_eq!(visible.len(), 2);
     assert_eq!(
         db::selection(&p, &admin, &Filters::default()).await?.len(),
@@ -200,7 +200,7 @@ async fn catalog_lifecycle_permissions_links_and_notifications() -> Result<()> {
         to: Some("2026-08-17".parse()?),
         ..Default::default()
     };
-    assert_eq!(db::search(&p, &u, &date_filter).await?.0, 1);
+    assert_eq!(db::search(&p, &u, &date_filter).await?.total, 1);
     let own_video: i64 = sqlx::query_scalar("SELECT id FROM videos WHERE pilot_id=$1")
         .bind(own)
         .fetch_one(&p)
@@ -236,12 +236,12 @@ async fn catalog_lifecycle_permissions_links_and_notifications() -> Result<()> {
         .execute(&p)
         .await?;
     scanner::scan_once(&p, &c).await?;
-    assert_eq!(db::search(&p, &u, &Filters::default()).await?.0, 0);
+    assert_eq!(db::search(&p, &u, &Filters::default()).await?.total, 0);
     sqlx::query("INSERT INTO device_aliases SELECT id,'t1' FROM devices")
         .execute(&p)
         .await?;
     scanner::scan_once(&p, &c).await?;
-    assert_eq!(db::search(&p, &u, &Filters::default()).await?.0, 2);
+    assert_eq!(db::search(&p, &u, &Filters::default()).await?.total, 2);
     // A link contains an immutable selection; making its owner private requests revocation.
     let link:i64=sqlx::query_scalar("INSERT INTO immich_shared_links(immich_id,immich_key,user_id,expires_at) VALUES($1,'secret',$2,now()+interval '7 days') RETURNING id").bind(Uuid::new_v4()).bind(u.id).fetch_one(&p).await?;
     sqlx::query("INSERT INTO immich_shared_link_videos VALUES($1,$2)")

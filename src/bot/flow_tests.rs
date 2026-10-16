@@ -354,7 +354,7 @@ async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_butt
             .all(|m| m["message_id"] != completed_form),
         "confirmed user card must remain in history"
     );
-    // All search/filter/page navigation edits the original search message.
+    // Inline navigation reuses the panel; the reply-keyboard Filters command reopens it.
     let search_messages = calls
         .iter()
         .filter(|m| {
@@ -420,12 +420,12 @@ async fn panels_recover_deleted_controls_without_duplicating_on_transport_errors
     let app = Router::new().route("/botTEST/:method",post(move |axum::extract::Path(method): axum::extract::Path<String>, Json(body): Json<serde_json::Value>| {
         let mut calls = log.lock().unwrap();
         calls.push(method.clone());
-        let problem = if method == "EditMessageText" { fail.lock().unwrap().take() } else { None };
+        let problem = if matches!(method.as_str(), "EditMessageText" | "SendMessage") { fail.lock().unwrap().take() } else { None };
         let (status, result) = if let Some((status,description)) = problem {
             (axum::http::StatusCode::from_u16(status).unwrap(),serde_json::json!({"ok":false,"error_code":status,"description":description}))
         } else {
             let id = body["message_id"].as_i64().unwrap_or(1000+calls.len() as i64);
-            (axum::http::StatusCode::OK,serde_json::json!({"ok":true,"result":{"message_id":id,"date":0,"chat":{"id":7777,"type":"private"},"text":body["text"]}}))
+            (axum::http::StatusCode::OK,serde_json::json!({"ok":true,"result": if method == "DeleteMessage" { serde_json::json!(true) } else { serde_json::json!({"message_id":id,"date":0,"chat":{"id":7777,"type":"private"},"text":body["text"]}) }}))
         };
         async move {(status,Json(result))}
     }));
@@ -516,6 +516,44 @@ async fn panels_recover_deleted_controls_without_duplicating_on_transport_errors
             .count(),
         2
     );
+    // Reopening must not delete the previous control if sending the new one fails.
+    panels::reopen_panel(chat, &state, PanelKind::Search).await;
+    *failure.lock().unwrap() = Some((503, "Service Unavailable".into()));
+    assert!(show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Reopen",
+        K::new(Vec::<Vec<B>>::new())
+    )
+    .await
+    .is_err());
+    assert!(!calls.lock().unwrap().iter().any(|m| m == "DeleteMessage"));
+    show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Reopen",
+        K::new(Vec::<Vec<B>>::new()),
+    )
+    .await?;
+    let methods = calls.lock().unwrap().clone();
+    assert_eq!(
+        &methods[methods.len() - 2..],
+        &["SendMessage", "DeleteMessage"]
+    );
+    show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Next step",
+        K::new(Vec::<Vec<B>>::new()),
+    )
+    .await?;
+    assert_eq!(calls.lock().unwrap().last().unwrap(), "EditMessageText");
     server.abort();
     Ok(())
 }
@@ -687,11 +725,11 @@ async fn search_multiselect_reset_pagination_and_visibility() -> Result<()> {
     assert!(has_button(&last(), "Аппараты: 2"));
     handle_callback(&bot, ChatId(7777), &state, &user, "search").await?;
     let f = state.sessions.lock().await[&user.id].filters.clone();
-    let (n, bytes, rows) = db::search(&pool, &user, &f).await?;
-    assert_eq!((n, bytes), (4, 1400));
+    let result = db::search(&pool, &user, &f).await?;
+    assert_eq!((result.total, result.size_bytes), (4, 1400));
     let expected = vec![videos[0], videos[1], videos[4], videos[5]];
     assert_eq!(db::selection(&pool, &user, &f).await?, expected);
-    let mut listed: Vec<_> = rows.into_iter().map(|v| v.id).collect();
+    let mut listed: Vec<_> = result.videos.into_iter().map(|v| v.id).collect();
     listed.sort_unstable();
     assert_eq!(listed, expected);
     // Even a direct JSON filter cannot expose a private pilot.
@@ -704,7 +742,7 @@ async fn search_multiselect_reset_pagination_and_visibility() -> Result<()> {
     assert_eq!(
         db::search(&pool, &user, &state.sessions.lock().await[&user.id].filters)
             .await?
-            .0,
+            .total,
         2
     );
     for action in ["toggle:osd", "toggle:osd"] {
@@ -725,7 +763,7 @@ async fn search_multiselect_reset_pagination_and_visibility() -> Result<()> {
     assert!(f.device.is_empty());
     assert_eq!(f.system, systems);
     assert_eq!(f.pilot, vec![user.id, public.id]);
-    assert_eq!(db::search(&pool, &user, &f).await?.0, 5);
+    assert_eq!(db::search(&pool, &user, &f).await?.total, 5);
     // Clearing the final checkbox means 'any', not an empty result set.
     for action in [
         format!("set:device:{}:0", devices[0]),
@@ -815,6 +853,235 @@ async fn search_multiselect_reset_pagination_and_visibility() -> Result<()> {
         .iter()
         .filter(|m| m["method"] == "EditMessageText")
         .all(|m| m["message_id"] == panel_id));
+    server.abort();
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await?;
+    admin_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_pages_stay_in_bounds_and_sections_reopen_visibly() -> Result<()> {
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        return Ok(());
+    };
+    let admin_pool = PgPool::connect(&url).await?;
+    let schema = format!("fpvpages_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin_pool)
+        .await?;
+    let path = schema.clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(move |conn, _| {
+            let path = path.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {path}"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await?;
+    sqlx::migrate!().run(&pool).await?;
+    db::bootstrap(&pool, 7777).await?;
+    let user = db::user(&pool, 7777).await?.unwrap();
+    let event: i64 = sqlx::query_scalar("INSERT INTO events(name) VALUES('test') RETURNING id")
+        .fetch_one(&pool)
+        .await?;
+    let ids: Vec<i64> = sqlx::query_scalar("INSERT INTO videos(relative_path,size_bytes,mtime_ns,event_id,pilot_id,state) SELECT 'test/video' || n || '.mp4',100,1,$1,$2,'classified' FROM generate_series(1,14) n RETURNING id")
+        .bind(event).bind(user.id).fetch_all(&pool).await?;
+    let temp = tempfile::tempdir()?;
+    let state = BotState::new(pool.clone(), Arc::new(config(temp.path().into())));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let app = telegram_mock(sent.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let bot = Bot::new("TEST").set_api_url(format!("http://{addr}").parse()?);
+    let last = || {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["method"] == "SendMessage" || m["method"] == "EditMessageText")
+            .unwrap()
+            .clone()
+    };
+    let buttons = |m: &serde_json::Value| {
+        m["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r.as_array().unwrap().clone())
+            .collect::<Vec<_>>()
+    };
+    let assert_page = |page: u32, pages: u32, count: usize| {
+        let m = last();
+        assert!(m["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("Страница {page} из {pages}")));
+        let keys = buttons(&m);
+        assert_eq!(
+            keys.iter()
+                .filter(|b| b["text"].as_str().unwrap().contains("Предыдущая"))
+                .count(),
+            usize::from(page > 1)
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|b| b["text"].as_str().unwrap().contains("Следующая"))
+                .count(),
+            usize::from(page < pages)
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|b| b["callback_data"].as_str().unwrap().starts_with("info:"))
+                .count(),
+            count
+        );
+    };
+    handle(&bot, ChatId(7777), &state, &user, Command::Catalog).await?;
+    assert_page(1, 2, 10);
+    let first_panel = last()["result_message_id"].clone();
+    for id in &ids[..2] {
+        handle(&bot, ChatId(7777), &state, &user, Command::Info(*id)).await?;
+        assert!(buttons(&last())
+            .iter()
+            .any(|b| b["callback_data"] == "closecard"));
+    }
+    let cards: Vec<_> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            m["method"] == "SendMessage" && m["text"].as_str().unwrap_or("").starts_with('#')
+        })
+        .map(|m| m["result_message_id"].clone())
+        .collect();
+    let cards_at = sent.lock().unwrap().len();
+    // Reply keyboard sections must be sent at the bottom before deleting the old control.
+    let mut old_panel = first_panel;
+    for (id, command, text) in [
+        (900, Command::Catalog, "🔎 Поиск видео"),
+        (901, Command::Filters, "🎛 Фильтры"),
+    ] {
+        let at = sent.lock().unwrap().len();
+        let msg: Message = serde_json::from_value(
+            serde_json::json!({"message_id":id,"date":0,"chat":{"id":7777,"type":"private"},"from":{"id":7777,"is_bot":false,"first_name":"Admin"},"text":text}),
+        )?;
+        message(bot.clone(), msg, command, state.clone()).await?;
+        let calls = sent.lock().unwrap().clone();
+        let new = last();
+        assert_eq!(new["method"], "SendMessage");
+        assert_ne!(new["result_message_id"], old_panel);
+        let send = calls[at..]
+            .iter()
+            .position(|m| m["method"] == "SendMessage")
+            .unwrap();
+        let delete = calls[at..]
+            .iter()
+            .position(|m| m["method"] == "DeleteMessage" && m["message_id"] == old_panel)
+            .unwrap();
+        assert!(send < delete);
+        assert!(calls[at..]
+            .iter()
+            .any(|m| m["method"] == "DeleteMessage" && m["message_id"] == id));
+        old_panel = new["result_message_id"].clone();
+    }
+    let navigation_at = sent.lock().unwrap().len();
+    handle_callback(&bot, ChatId(7777), &state, &user, "search").await?;
+    handle_callback(&bot, ChatId(7777), &state, &user, "searchpage:1").await?;
+    assert_page(2, 2, 4);
+    // A double click targets the same page; old next callbacks and /next also clamp.
+    for action in ["searchpage:1", "next", "next", "searchpage:4294967295"] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+        assert_page(2, 2, 4);
+        assert_eq!(state.sessions.lock().await[&user.id].filters.page, 1);
+    }
+    for action in ["prev", "prev"] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+        assert_page(1, 2, 10);
+    }
+    sqlx::query("INSERT INTO videos(relative_path,size_bytes,mtime_ns,event_id,pilot_id,state) SELECT 'test/video' || n || '.mp4',100,1,$1,$2,'classified' FROM generate_series(15,21) n")
+        .bind(event).bind(user.id).execute(&pool).await?;
+    handle_callback(&bot, ChatId(7777), &state, &user, "searchpage:1").await?;
+    assert_page(2, 3, 10);
+    handle_callback(&bot, ChatId(7777), &state, &user, "searchpage:2").await?;
+    assert_page(3, 3, 1);
+    // User-entered page numbers must be clamped too.
+    handle(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        Command::Search(r#"{"page":4294967295}"#.into()),
+    )
+    .await?;
+    assert_page(3, 3, 1);
+    // Removing results while on the final page adjusts the page and the buttons.
+    sqlx::query("UPDATE videos SET state='missing' WHERE id > $1")
+        .bind(ids[9])
+        .execute(&pool)
+        .await?;
+    handle_callback(&bot, ChatId(7777), &state, &user, "search").await?;
+    assert_page(1, 1, 10);
+    assert_eq!(state.sessions.lock().await[&user.id].filters.page, 0);
+    sqlx::query("UPDATE videos SET state='missing' WHERE id <> $1")
+        .bind(ids[0])
+        .execute(&pool)
+        .await?;
+    handle_callback(&bot, ChatId(7777), &state, &user, "next").await?;
+    assert_page(1, 1, 1);
+    sqlx::query("UPDATE videos SET state='missing'")
+        .execute(&pool)
+        .await?;
+    for action in ["next", "prev", "searchpage:4294967295"] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+        assert!(last()["text"]
+            .as_str()
+            .unwrap()
+            .contains("Найдено видео: 0"));
+        assert!(buttons(&last()).iter().all(|b| !b["callback_data"]
+            .as_str()
+            .unwrap()
+            .starts_with("searchpage:")));
+        assert_eq!(state.sessions.lock().await[&user.id].filters.page, 0);
+    }
+    let calls = sent.lock().unwrap().clone();
+    assert!(calls[navigation_at..]
+        .iter()
+        .filter(|m| m["method"] == "EditMessageText")
+        .all(|m| m["message_id"] == old_panel));
+    assert!(calls[navigation_at..]
+        .iter()
+        .all(|m| m["method"] != "SendMessage"));
+    assert!(calls[cards_at..]
+        .iter()
+        .all(|m| !cards.contains(&m["message_id"])));
+    // Closing a card removes exactly that message, without changing other cards or selection.
+    let selection = state.sessions.lock().await[&user.id].selection.clone();
+    let q: CallbackQuery = serde_json::from_value(
+        serde_json::json!({"id":"close-one-card","from":{"id":7777,"is_bot":false,"first_name":"Admin"},"chat_instance":"test","message":{"message_id":cards[0],"date":1,"chat":{"id":7777,"type":"private"},"from":{"id":123,"is_bot":true,"first_name":"Bot"},"text":"video card"},"data":"closecard"}),
+    )?;
+    let at = sent.lock().unwrap().len();
+    callback(bot.clone(), q, state.clone()).await?;
+    let calls = sent.lock().unwrap().clone();
+    assert_eq!(
+        calls[at..]
+            .iter()
+            .filter(|m| m["method"] == "DeleteMessage" && m["message_id"] == cards[0])
+            .count(),
+        1
+    );
+    assert!(calls[at..].iter().all(|m| m["message_id"] != cards[1]));
+    assert!(calls[at..]
+        .iter()
+        .any(|m| m["method"] == "AnswerCallbackQuery"));
+    assert_eq!(state.sessions.lock().await[&user.id].selection, selection);
     server.abort();
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

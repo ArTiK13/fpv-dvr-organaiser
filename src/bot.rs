@@ -74,6 +74,8 @@ enum Command {
     Search(String),
     #[command(description = "следующая страница")]
     Next,
+    #[command(description = "предыдущая страница")]
+    Prev,
     #[command(description = "информация о видео: ID")]
     Info(i64),
     #[command(description = "Immich-ссылка: ID")]
@@ -177,7 +179,16 @@ async fn message(bot: Bot, msg: Message, cmd: Command, s: BotState) -> ResponseR
             Command::Start | Command::Menu | Command::Admin | Command::Catalog
             | Command::Search(_) | Command::Filters | Command::Subscriptions
             | Command::Notifications | Command::Notify(_) | Command::Subscribe(_)
-            | Command::Adduser | Command::User(_) | Command::Next);
+            | Command::Adduser | Command::User(_) | Command::Next | Command::Prev);
+        let section = match &cmd {
+            Command::Catalog | Command::Search(_) | Command::Filters => Some(PanelKind::Search),
+            Command::Subscriptions => Some(PanelKind::Subscriptions),
+            Command::Notifications => Some(PanelKind::Notifications),
+            _ => None,
+        };
+        if let Some(kind) = section {
+            panels::reopen_panel(msg.chat.id, &s, kind).await;
+        }
         handle(&bot, msg.chat.id, &s, &u, cmd).await?;
         if cleanup { panels::remove_input(&bot, msg.chat.id, msg.id, &s).await; }
         Ok(())
@@ -290,10 +301,14 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
             s.sessions.lock().await.entry(u.id).or_default().filters = f;
             show_search(bot, chat, s, u).await?;
         }
-        Command::Next => {
+        Command::Next | Command::Prev => {
             let mut sessions = s.sessions.lock().await;
             let page = &mut sessions.entry(u.id).or_default().filters.page;
-            *page = page.saturating_add(1);
+            *page = if matches!(cmd, Command::Prev) {
+                page.saturating_sub(1)
+            } else {
+                page.saturating_add(1)
+            };
             drop(sessions);
             show_search(bot, chat, s, u).await?;
         }
@@ -692,9 +707,18 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
         .or_default()
         .filters
         .clone();
-    let (n, bytes, rows) = db::search(&s.pool, u, &f).await?;
+    let result = db::search(&s.pool, u, &f).await?;
+    {
+        let mut sessions = s.sessions.lock().await;
+        let current = &mut sessions.entry(u.id).or_default().filters;
+        // A slow query must not overwrite filters changed while it was running.
+        if *current == f {
+            current.page = result.page;
+        }
+    }
+    let n = result.total;
     let mut keyboard = vec![];
-    for v in &rows {
+    for v in &result.videos {
         keyboard.push(vec![B::callback(
             format!(
                 "#{} {}",
@@ -704,10 +728,23 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
             format!("info:{}", v.id),
         )]);
     }
-    keyboard.push(vec![
-        B::callback("Следующая", "next"),
-        B::callback("Фильтры", "filters"),
-    ]);
+    let mut navigation = vec![];
+    if result.page > 0 {
+        navigation.push(B::callback(
+            "← Предыдущая",
+            format!("searchpage:{}", result.page - 1),
+        ));
+    }
+    if result.page + 1 < result.pages {
+        navigation.push(B::callback(
+            "Следующая →",
+            format!("searchpage:{}", result.page + 1),
+        ));
+    }
+    if !navigation.is_empty() {
+        keyboard.push(navigation);
+    }
+    keyboard.push(vec![B::callback("Фильтры", "filters")]);
     keyboard.push(vec![B::callback("↺ Сбросить все фильтры", "reset")]);
     keyboard.push(vec![
         B::callback("Все как видео", "all:video"),
@@ -720,9 +757,13 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
         s,
         PanelKind::Search,
         format!(
-            "🔎 Найдено видео: {n}\nОбщий размер: {}\nСтраница {}\n\n{}",
-            ui::size(bytes),
-            f.page + 1,
+            "🔎 Найдено видео: {n}\nОбщий размер: {}\n{}\n\n{}",
+            ui::size(result.size_bytes),
+            if n == 0 {
+                "По этим фильтрам видео не найдены. Измените или сбросьте фильтры.".into()
+            } else {
+                format!("Страница {} из {}", result.page + 1, result.pages)
+            },
             filter_summary(&s.pool, u, &f).await?
         ),
         K::new(keyboard),
@@ -750,6 +791,7 @@ async fn show_info(bot: &Bot, chat: ChatId, s: &BotState, u: &User, id: i64) -> 
             format!("fallback:{id}"),
         )]);
     }
+    keys.push(vec![B::callback("✕ Закрыть", "closecard")]);
     let duration = v
         .duration_ms
         .map(|d| format!("{:.1} с", d as f64 / 1000.0))
@@ -794,7 +836,13 @@ async fn callback(bot: Bot, q: CallbackQuery, s: BotState) -> ResponseResult<()>
             .await?
             .filter(|u| u.active)
             .context("Доступ закрыт")?;
-        handle_callback(&bot, chat, &s, &u, q.data.as_deref().unwrap_or_default()).await
+        if q.data.as_deref() == Some("closecard") {
+            // Only an explicit click closes this card; other results stay in history.
+            bot.delete_message(chat, msg.id()).await?;
+            Ok(())
+        } else {
+            handle_callback(&bot, chat, &s, &u, q.data.as_deref().unwrap_or_default()).await
+        }
     }
     .await;
     if let Err(e) = result {
@@ -850,6 +898,7 @@ async fn handle_callback(
     match data {
         "search" => return show_search(bot, chat, s, u).await,
         "next" => return handle(bot, chat, s, u, Command::Next).await,
+        "prev" => return handle(bot, chat, s, u, Command::Prev).await,
         "jobs" => return handle(bot, chat, s, u, Command::Jobs).await,
         "filters" => return show_filters(bot, chat, s, u).await,
         "reset" | "resetfilters" => {
@@ -862,6 +911,16 @@ async fn handle_callback(
         }
         "subscriptions" => return show_subscriptions(bot, chat, s, u).await,
         _ => {}
+    }
+    if let Some(page) = data.strip_prefix("searchpage:") {
+        s.sessions
+            .lock()
+            .await
+            .entry(u.id)
+            .or_default()
+            .filters
+            .page = page.parse()?;
+        return show_search(bot, chat, s, u).await;
     }
     if let Some(nonce) = data.strip_prefix("confirm:") {
         if !s.config.delivery_enabled {

@@ -62,7 +62,7 @@ pub async fn bootstrap(pool: &PgPool, tg: i64) -> Result<()> {
     }
     Ok(())
 }
-#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Filters {
     pub from: Option<NaiveDate>,
@@ -157,21 +157,52 @@ fn restrictions(q: &mut QueryBuilder<'_, Postgres>, u: &User, f: &Filters) {
             .push_bind(format!("%{v}%"));
     }
 }
-pub async fn search(pool: &PgPool, u: &User, f: &Filters) -> Result<(i64, i64, Vec<Video>)> {
+pub const SEARCH_PAGE_SIZE: i64 = 10;
+
+pub struct SearchResults {
+    pub total: i64,
+    pub size_bytes: i64,
+    pub videos: Vec<Video>,
+    /// Zero-based, clamped to the available pages in this database snapshot.
+    pub page: u32,
+    /// Empty searches have one display page, with no navigation buttons.
+    pub pages: u32,
+}
+
+pub async fn search(pool: &PgPool, u: &User, f: &Filters) -> Result<SearchResults> {
     if matches!((f.from,f.to),(Some(a),Some(b)) if a>b) {
         bail!("Начало диапазона позже конца");
     }
+    // Counts, bounds and rows must agree even if the scanner changes the catalogue.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let mut count = QueryBuilder::new(format!(
         "SELECT count(*),coalesce(sum(v.size_bytes),0)::bigint{JOINS}"
     ));
     restrictions(&mut count, u, f);
-    let (n, bytes) = count.build_query_as::<(i64, i64)>().fetch_one(pool).await?;
+    let (total, size_bytes) = count
+        .build_query_as::<(i64, i64)>()
+        .fetch_one(&mut *tx)
+        .await?;
+    let pages = ((total.max(1) - 1) / SEARCH_PAGE_SIZE + 1).min(i64::from(u32::MAX)) as u32;
+    let page = f.page.min(pages - 1);
     let mut q = QueryBuilder::new(format!("{SELECT}{JOINS}"));
     restrictions(&mut q, u, f);
-    q.push(" ORDER BY v.id DESC LIMIT 10 OFFSET ")
-        .push_bind(i64::from(f.page) * 10);
-    let rows = q.build_query_as().fetch_all(pool).await?;
-    Ok((n, bytes, rows))
+    q.push(" ORDER BY v.id DESC LIMIT ")
+        .push_bind(SEARCH_PAGE_SIZE)
+        .push(" OFFSET ")
+        .push_bind(i64::from(page) * SEARCH_PAGE_SIZE);
+    let videos = q.build_query_as().fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(SearchResults {
+        total,
+        size_bytes,
+        videos,
+        page,
+        pages,
+    })
 }
 pub async fn selection(pool: &PgPool, u: &User, f: &Filters) -> Result<Vec<i64>> {
     let mut q = QueryBuilder::new(format!("SELECT v.id{JOINS}"));

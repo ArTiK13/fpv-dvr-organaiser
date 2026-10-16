@@ -13,6 +13,7 @@ pub(super) enum PanelKind {
 #[derive(Clone)]
 struct Panel {
     id: MessageId,
+    reopen: bool,
 }
 #[derive(Default)]
 struct ChatPanels {
@@ -36,14 +37,21 @@ async fn update(
     text: String,
     keys: K,
 ) -> Result<()> {
-    if let Some(old) = panels.inline.get(&kind) {
+    let old = panels.inline.get(&kind).cloned();
+    if let Some(old) = old.as_ref().filter(|old| !old.reopen) {
         match bot
             .edit_message_text(chat, old.id, text.clone())
             .reply_markup(keys.clone())
             .await
         {
             Ok(_) | Err(RequestError::Api(ApiError::MessageNotModified)) => {
-                panels.inline.insert(kind, Panel { id: old.id });
+                panels.inline.insert(
+                    kind,
+                    Panel {
+                        id: old.id,
+                        reopen: false,
+                    },
+                );
                 return Ok(());
             }
             // A deleted/expired control can be recreated; transport failures must not produce duplicates.
@@ -57,8 +65,32 @@ async fn update(
         .send_message(chat, text.clone())
         .reply_markup(keys.clone())
         .await?;
-    panels.inline.insert(kind, Panel { id: message.id });
+    panels.inline.insert(
+        kind,
+        Panel {
+            id: message.id,
+            reopen: false,
+        },
+    );
+    if let Some(old) = old.filter(|old| old.reopen) {
+        // Delete only the old control, and only after the new one is visible.
+        // A cleanup failure must not hide the newly opened section.
+        if bot.delete_message(chat, old.id).await.is_err() {
+            tracing::debug!("could not remove previous section control");
+        }
+    }
     Ok(())
+}
+
+/// Opening a section from the reply keyboard should place it at the bottom of
+/// the chat. Inline steps keep editing that newly opened control in place.
+/// Keep the old control until its replacement has been sent successfully.
+pub(super) async fn reopen_panel(chat: ChatId, s: &BotState, kind: PanelKind) {
+    let state = s.panels.chat(chat).await;
+    let mut state = state.lock().await;
+    if let Some(panel) = state.inline.get_mut(&kind) {
+        panel.reopen = true;
+    }
 }
 
 pub(super) async fn show_panel(
