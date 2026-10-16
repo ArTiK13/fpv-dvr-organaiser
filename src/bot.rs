@@ -1,5 +1,6 @@
 mod management;
 mod panels;
+mod search_filters;
 mod user_form;
 use crate::{
     config::Config,
@@ -707,6 +708,7 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
         B::callback("Следующая", "next"),
         B::callback("Фильтры", "filters"),
     ]);
+    keyboard.push(vec![B::callback("↺ Сбросить все фильтры", "reset")]);
     keyboard.push(vec![
         B::callback("Все как видео", "all:video"),
         B::callback("Все как файлы", "all:document"),
@@ -850,9 +852,13 @@ async fn handle_callback(
         "next" => return handle(bot, chat, s, u, Command::Next).await,
         "jobs" => return handle(bot, chat, s, u, Command::Jobs).await,
         "filters" => return show_filters(bot, chat, s, u).await,
-        "reset" => {
+        "reset" | "resetfilters" => {
             s.sessions.lock().await.entry(u.id).or_default().filters = Filters::default();
-            return show_search(bot, chat, s, u).await;
+            return if data == "resetfilters" {
+                show_filters(bot, chat, s, u).await
+            } else {
+                show_search(bot, chat, s, u).await
+            };
         }
         "subscriptions" => return show_subscriptions(bot, chat, s, u).await,
         _ => {}
@@ -898,43 +904,36 @@ async fn handle_callback(
         )
         .await?;
     } else if let Some(kind) = data.strip_prefix("pick:") {
-        let rows: Vec<(i64, String)> = match kind {
-            "device" => sqlx::query_as("SELECT id,name FROM devices WHERE active ORDER BY id LIMIT 50").fetch_all(&s.pool).await?,
-            "system" => sqlx::query_as("SELECT id,name FROM video_systems WHERE active ORDER BY id LIMIT 50").fetch_all(&s.pool).await?,
-            "pilot" => sqlx::query_as("SELECT id,coalesce(nickname,full_name,telegram_username,'Пилот') FROM users WHERE active AND (id=$1 OR is_public OR $2) ORDER BY id LIMIT 50")
-                .bind(u.id).bind(u.is_admin).fetch_all(&s.pool).await?,
-            _ => bail!("Неизвестный фильтр"),
-        };
-        panels::leave_form(bot, chat, s, u).await;
-        let mut keys = rows
-            .into_iter()
-            .map(|(id, name)| vec![B::callback(name, format!("set:{kind}:{id}"))])
-            .collect::<Vec<_>>();
-        keys.push(vec![B::callback("← Назад к фильтрам", "filters")]);
-        show_panel(
-            bot,
-            chat,
-            s,
-            PanelKind::Search,
-            "Выберите значение:",
-            K::new(keys),
-        )
-        .await?;
+        search_filters::show_picker(bot, chat, s, u, kind, 0).await?;
+    } else if let Some(value) = data.strip_prefix("pickpage:") {
+        let (kind, page) = value.split_once(':').context("callback")?;
+        search_filters::show_picker(bot, chat, s, u, kind, page.parse()?).await?;
     } else if let Some(value) = data.strip_prefix("set:") {
-        let (kind, id) = value.split_once(':').context("callback")?;
-        let id: i64 = id.parse()?;
+        let mut parts = value.split(':');
+        let kind = parts.next().context("callback")?;
+        let id: i64 = parts.next().context("callback")?.parse()?;
+        let page = parts.next().unwrap_or("0").parse()?;
+        search_filters::toggle_choice(s, u, kind, id).await?;
+        search_filters::show_picker(bot, chat, s, u, kind, page).await?;
+    } else if let Some(kind) = data.strip_prefix("clear:") {
         {
             let mut sessions = s.sessions.lock().await;
             let f = &mut sessions.entry(u.id).or_default().filters;
             match kind {
-                "device" => f.device = Some(id),
-                "system" => f.system = Some(id),
-                "pilot" => f.pilot = Some(id),
-                _ => bail!("Неизвестный фильтр"),
+                "date" => {
+                    f.from = None;
+                    f.to = None;
+                }
+                "text" => f.text = None,
+                _ => search_filters::choices_mut(f, kind)?.clear(),
             }
             f.page = 0;
         }
-        show_search(bot, chat, s, u).await?;
+        if matches!(kind, "date" | "text") {
+            show_filters(bot, chat, s, u).await?;
+        } else {
+            search_filters::show_picker(bot, chat, s, u, kind, 0).await?;
+        }
     } else if let Some(kind) = data.strip_prefix("toggle:") {
         {
             let mut sessions = s.sessions.lock().await;
@@ -951,7 +950,7 @@ async fn handle_callback(
             };
             f.page = 0;
         }
-        show_search(bot, chat, s, u).await?;
+        show_filters(bot, chat, s, u).await?;
     } else if let Some(mode) = data.strip_prefix("all:") {
         handle(bot, chat, s, u, Command::All(mode.into())).await?;
     } else if let Some((action, id)) = data.split_once(':') {
@@ -972,12 +971,55 @@ async fn handle_callback(
 }
 async fn show_filters(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
     panels::leave_form(bot, chat, s, u).await;
-    show_panel(bot,chat,s,PanelKind::Search, "Выберите фильтр. Для OSD и цветокоррекции повторное нажатие переключает: любые → да → нет. Даты можно задать командой /search из помощи.",K::new(vec![
-            vec![B::callback("Аппарат", "pick:device"), B::callback("Видеосистема", "pick:system")],
-            vec![B::callback("Пилот", "pick:pilot"), B::callback("OSD", "toggle:osd")],
-            vec![B::callback("Цветокоррекция", "toggle:colored"), B::callback("Сбросить", "reset")],
-            vec![B::callback("Показать видео", "search")],
-        ])).await?;
+    let f = s
+        .sessions
+        .lock()
+        .await
+        .entry(u.id)
+        .or_default()
+        .filters
+        .clone();
+    let label = |name: &str, count: usize| {
+        if count == 0 {
+            format!("{name}: все")
+        } else {
+            format!("{name}: {count}")
+        }
+    };
+    let boolean = |value| match value {
+        None => "любые",
+        Some(true) => "есть",
+        Some(false) => "нет",
+    };
+    let mut keys = vec![
+        vec![B::callback(
+            label("Аппараты", f.device.len()),
+            "pick:device",
+        )],
+        vec![B::callback(
+            label("Видеосистемы", f.system.len()),
+            "pick:system",
+        )],
+        vec![B::callback(label("Пилоты", f.pilot.len()), "pick:pilot")],
+        vec![
+            B::callback(format!("OSD: {}", boolean(f.osd)), "toggle:osd"),
+            B::callback(format!("Цвет: {}", boolean(f.colored)), "toggle:colored"),
+        ],
+    ];
+    if f.from.is_some() || f.to.is_some() {
+        keys.push(vec![B::callback("Сбросить даты", "clear:date")]);
+    }
+    if f.text.is_some() {
+        keys.push(vec![B::callback(
+            "Сбросить поиск по названию",
+            "clear:text",
+        )]);
+    }
+    keys.push(vec![B::callback("↺ Сбросить все фильтры", "resetfilters")]);
+    keys.push(vec![B::callback("🔎 Показать видео", "search")]);
+    show_panel(bot,chat,s,PanelKind::Search,
+        format!("🎛 Фильтры поиска\n\n{}\n\nВ аппаратах, видеосистемах и пилотах можно отметить несколько вариантов. Внутри фильтра подходит любой выбранный вариант; разные фильтры применяются вместе.\n\nOSD и цвет: любые → есть → нет. Даты можно задать командой /search из помощи.", filter_summary(&s.pool, u, &f).await?),
+        K::new(keys)).await?;
     Ok(())
 }
 async fn show_subscriptions(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
@@ -1163,29 +1205,15 @@ async fn filter_summary(pool: &PgPool, u: &User, f: &Filters) -> Result<String> 
                 .unwrap_or("до конца архива".into())
         ));
     }
-    if let Some(id) = f.device {
-        let name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
-        parts.push(format!("Аппарат: {}", name.as_deref().unwrap_or("удалён")));
-    }
-    if let Some(id) = f.system {
-        let name: Option<String> = sqlx::query_scalar("SELECT name FROM video_systems WHERE id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
-        parts.push(format!(
-            "Видеосистема: {}",
-            name.as_deref().unwrap_or("удалена")
-        ));
-    }
-    if let Some(id) = f.pilot {
-        let name: Option<String> = sqlx::query_scalar("SELECT coalesce(nickname,full_name,telegram_username,'Пилот') FROM users WHERE id=$1 AND active AND (id=$2 OR is_public OR $3)").bind(id).bind(u.id).bind(u.is_admin).fetch_optional(pool).await?;
-        parts.push(format!(
-            "Пилот: {}",
-            name.as_deref().unwrap_or("недоступен")
-        ));
+    for (kind, label, ids) in [
+        ("device", "Аппараты", &f.device),
+        ("system", "Видеосистемы", &f.system),
+        ("pilot", "Пилоты", &f.pilot),
+    ] {
+        if !ids.is_empty() {
+            let names = search_filters::selected_names(pool, u, kind, ids).await?;
+            parts.push(format!("{label}: {}", names.join(", ")));
+        }
     }
     if let Some(value) = f.osd {
         parts.push(format!("OSD: {}", if value { "есть" } else { "нет" }));
@@ -1209,6 +1237,18 @@ async fn filter_summary(pool: &PgPool, u: &User, f: &Filters) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_json_accepts_existing_single_ids_and_multiple_ids() {
+        let f: Filters =
+            serde_json::from_value(serde_json::json!({"device":1,"system":[2,3,2],"pilot":null}))
+                .unwrap();
+        assert_eq!(f.device, vec![1]);
+        assert_eq!(f.system, vec![2, 3]);
+        assert!(f.pilot.is_empty());
+        let f: Filters = serde_json::from_str("{}").unwrap();
+        assert!(f.device.is_empty() && f.system.is_empty() && f.pilot.is_empty());
+        assert!(serde_json::from_str::<Filters>(r#"{"device":["bad"]}"#).is_err());
+    }
     #[test]
     fn confirmations_are_bound_to_snapshot_and_consumed_once() {
         let nonce = Uuid::new_v4();

@@ -67,14 +67,34 @@ pub async fn bootstrap(pool: &PgPool, tg: i64) -> Result<()> {
 pub struct Filters {
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
-    pub device: Option<i64>,
-    pub system: Option<i64>,
+    #[serde(default, deserialize_with = "filter_ids")]
+    pub device: Vec<i64>,
+    #[serde(default, deserialize_with = "filter_ids")]
+    pub system: Vec<i64>,
     pub osd: Option<bool>,
     pub colored: Option<bool>,
-    pub pilot: Option<i64>,
+    #[serde(default, deserialize_with = "filter_ids")]
+    pub pilot: Vec<i64>,
     pub text: Option<String>,
     #[serde(default)]
     pub page: u32,
+}
+// Keep existing /search JSON commands accepting one ID, as well as lists and null.
+fn filter_ids<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Ids {
+        One(i64),
+        Many(Vec<i64>),
+    }
+    let mut ids = match Option::<Ids>::deserialize(deserializer)? {
+        Some(Ids::One(id)) => vec![id],
+        Some(Ids::Many(ids)) => ids,
+        None => vec![],
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 #[derive(Clone, Debug, FromRow)]
 pub struct Video {
@@ -111,14 +131,20 @@ fn restrictions(q: &mut QueryBuilder<'_, Postgres>, u: &User, f: &Filters) {
     if let Some(v) = f.to {
         q.push(" AND e.date_start<=").push_bind(v);
     }
-    if let Some(v) = f.device {
-        q.push(" AND v.device_id=").push_bind(v);
+    if !f.device.is_empty() {
+        q.push(" AND v.device_id=ANY(")
+            .push_bind(f.device.clone())
+            .push(")");
     }
-    if let Some(v) = f.system {
-        q.push(" AND v.video_system_id=").push_bind(v);
+    if !f.system.is_empty() {
+        q.push(" AND v.video_system_id=ANY(")
+            .push_bind(f.system.clone())
+            .push(")");
     }
-    if let Some(v) = f.pilot {
-        q.push(" AND v.pilot_id=").push_bind(v);
+    if !f.pilot.is_empty() {
+        q.push(" AND v.pilot_id=ANY(")
+            .push_bind(f.pilot.clone())
+            .push(")");
     }
     if let Some(v) = f.osd {
         q.push(" AND s.with_osd=").push_bind(v);

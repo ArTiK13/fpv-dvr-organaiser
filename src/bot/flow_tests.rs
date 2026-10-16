@@ -519,3 +519,307 @@ async fn panels_recover_deleted_controls_without_duplicating_on_transport_errors
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn search_multiselect_reset_pagination_and_visibility() -> Result<()> {
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        return Ok(());
+    };
+    let admin_pool = PgPool::connect(&url).await?;
+    let schema = format!("fpvsearch_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin_pool)
+        .await?;
+    let path = schema.clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(move |conn, _| {
+            let path = path.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {path}"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await?;
+    sqlx::migrate!().run(&pool).await?;
+    for (tg, name, public) in [
+        (7777_i64, "Viewer", false),
+        (8888, "Public", true),
+        (9999, "Private", false),
+    ] {
+        sqlx::query("INSERT INTO users(telegram_id,nickname,is_public) VALUES($1,$2,$3)")
+            .bind(tg)
+            .bind(name)
+            .bind(public)
+            .execute(&pool)
+            .await?;
+    }
+    let user = db::user(&pool, 7777).await?.unwrap();
+    let public = db::user(&pool, 8888).await?.unwrap();
+    let private = db::user(&pool, 9999).await?.unwrap();
+    let mut devices = vec![];
+    for i in 0..14 {
+        devices.push(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO devices(name,type) VALUES($1,'plane') RETURNING id",
+            )
+            .bind(format!("Device {i}"))
+            .fetch_one(&pool)
+            .await?,
+        );
+    }
+    let mut systems = vec![];
+    for (name, osd) in [("N3", true), ("O4", false)] {
+        systems.push(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO video_systems(name,with_osd) VALUES($1,$2) RETURNING id",
+            )
+            .bind(name)
+            .bind(osd)
+            .fetch_one(&pool)
+            .await?,
+        );
+    }
+    let event: i64 = sqlx::query_scalar("INSERT INTO events(name) VALUES('test') RETURNING id")
+        .fetch_one(&pool)
+        .await?;
+    let mut videos = vec![];
+    for (i, (device, system, pilot, bytes)) in [
+        (devices[0], systems[0], user.id, 100_i64),
+        (devices[1], systems[1], public.id, 200),
+        (devices[2], systems[0], user.id, 300),
+        (devices[0], systems[0], private.id, 400),
+        (devices[0], systems[1], user.id, 500),
+        (devices[1], systems[0], public.id, 600),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        videos.push(sqlx::query_scalar::<_, i64>("INSERT INTO videos(relative_path,size_bytes,mtime_ns,event_id,device_id,video_system_id,pilot_id,state) VALUES($1,$2,1,$3,$4,$5,$6,'classified') RETURNING id")
+            .bind(format!("test/video{i}.mp4")).bind(bytes).bind(event).bind(device).bind(system).bind(pilot)
+            .fetch_one(&pool).await?);
+    }
+    let temp = tempfile::tempdir()?;
+    let state = BotState::new(pool.clone(), Arc::new(config(temp.path().into())));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let app = telegram_mock(sent.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let bot = Bot::new("TEST").set_api_url(format!("http://{addr}").parse()?);
+    let last = || sent.lock().unwrap().last().unwrap().clone();
+    let has_button = |m: &serde_json::Value, text: &str| {
+        m["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .any(|b| b["text"].as_str().unwrap().contains(text))
+    };
+    handle(&bot, ChatId(7777), &state, &user, Command::Catalog).await?;
+    assert!(has_button(&last(), "Сбросить все фильтры"));
+    let panel_id = last()["result_message_id"].clone();
+    handle_callback(&bot, ChatId(7777), &state, &user, "pick:device").await?;
+    assert!(has_button(&last(), "⬜️ Device 0"));
+    assert!(has_button(&last(), "→"));
+    handle_callback(&bot, ChatId(7777), &state, &user, "pickpage:device:1").await?;
+    assert!(has_button(&last(), "Device 13"));
+    handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("set:device:{}:1", devices[13]),
+    )
+    .await?;
+    assert!(has_button(&last(), "✅ Device 13"));
+    assert!(last()["text"].as_str().unwrap().contains("страница 2 из 2"));
+    handle_callback(&bot, ChatId(7777), &state, &user, "clear:device").await?;
+    for id in &devices[..2] {
+        handle_callback(
+            &bot,
+            ChatId(7777),
+            &state,
+            &user,
+            &format!("set:device:{id}:0"),
+        )
+        .await?;
+    }
+    assert!(has_button(&last(), "✅ Device 0"));
+    assert!(has_button(&last(), "✅ Device 1"));
+    assert!(last()["text"].as_str().unwrap().contains("Выбрано: 2"));
+    for (kind, ids) in [
+        ("system", systems.clone()),
+        ("pilot", vec![user.id, public.id]),
+    ] {
+        for id in ids {
+            handle_callback(
+                &bot,
+                ChatId(7777),
+                &state,
+                &user,
+                &format!("set:{kind}:{id}:0"),
+            )
+            .await?;
+        }
+    }
+    assert!(!has_button(&last(), "Private"));
+    assert!(handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("set:pilot:{}:0", private.id)
+    )
+    .await
+    .is_err());
+    handle_callback(&bot, ChatId(7777), &state, &user, "filters").await?;
+    assert!(last()["text"]
+        .as_str()
+        .unwrap()
+        .contains("Аппараты: Device 0, Device 1"));
+    assert!(last()["text"]
+        .as_str()
+        .unwrap()
+        .contains("Видеосистемы: N3, O4"));
+    assert!(has_button(&last(), "Аппараты: 2"));
+    handle_callback(&bot, ChatId(7777), &state, &user, "search").await?;
+    let f = state.sessions.lock().await[&user.id].filters.clone();
+    let (n, bytes, rows) = db::search(&pool, &user, &f).await?;
+    assert_eq!((n, bytes), (4, 1400));
+    let expected = vec![videos[0], videos[1], videos[4], videos[5]];
+    assert_eq!(db::selection(&pool, &user, &f).await?, expected);
+    let mut listed: Vec<_> = rows.into_iter().map(|v| v.id).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, expected);
+    // Even a direct JSON filter cannot expose a private pilot.
+    let mut forged = f.clone();
+    forged.pilot.push(private.id);
+    assert_eq!(db::selection(&pool, &user, &forged).await?, expected);
+    // Booleans still combine with the OR selections of other categories.
+    handle_callback(&bot, ChatId(7777), &state, &user, "toggle:osd").await?;
+    assert!(has_button(&last(), "OSD: есть"));
+    assert_eq!(
+        db::search(&pool, &user, &state.sessions.lock().await[&user.id].filters)
+            .await?
+            .0,
+        2
+    );
+    for action in ["toggle:osd", "toggle:osd"] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+    }
+    handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("set:device:{}:0", devices[1]),
+    )
+    .await?;
+    assert!(has_button(&last(), "⬜️ Device 1"));
+    assert!(has_button(&last(), "✅ Device 0"));
+    handle_callback(&bot, ChatId(7777), &state, &user, "clear:device").await?;
+    let f = state.sessions.lock().await[&user.id].filters.clone();
+    assert!(f.device.is_empty());
+    assert_eq!(f.system, systems);
+    assert_eq!(f.pilot, vec![user.id, public.id]);
+    assert_eq!(db::search(&pool, &user, &f).await?.0, 5);
+    // Clearing the final checkbox means 'any', not an empty result set.
+    for action in [
+        format!("set:device:{}:0", devices[0]),
+        format!("set:device:{}:0", devices[0]),
+    ] {
+        handle_callback(&bot, ChatId(7777), &state, &user, &action).await?;
+    }
+    assert!(state.sessions.lock().await[&user.id]
+        .filters
+        .device
+        .is_empty());
+    {
+        let mut sessions = state.sessions.lock().await;
+        let f = &mut sessions.get_mut(&user.id).unwrap().filters;
+        f.text = Some("narrow search".into());
+        f.from = Some("2026-01-01".parse()?);
+        f.to = Some("2026-12-31".parse()?);
+        f.colored = Some(true);
+        f.page = 10;
+    }
+    for action in [
+        "clear:system",
+        "clear:pilot",
+        "clear:date",
+        "clear:text",
+        "resetfilters",
+    ] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+    }
+    assert!(has_button(&last(), "Аппараты: все"));
+    assert!(has_button(&last(), "OSD: любые"));
+    assert_eq!(
+        serde_json::to_value(&state.sessions.lock().await[&user.id].filters)?,
+        serde_json::to_value(Filters::default())?
+    );
+    // Reset directly from results must remove every category, dates, text and pagination.
+    state
+        .sessions
+        .lock()
+        .await
+        .get_mut(&user.id)
+        .unwrap()
+        .filters = Filters {
+        device: devices[..2].to_vec(),
+        system: systems.clone(),
+        pilot: vec![user.id],
+        from: Some("2026-01-01".parse()?),
+        to: Some("2026-12-31".parse()?),
+        text: Some("narrow".into()),
+        osd: Some(false),
+        colored: Some(true),
+        page: 10,
+    };
+    handle_callback(&bot, ChatId(7777), &state, &user, "reset").await?;
+    assert_eq!(
+        serde_json::to_value(&state.sessions.lock().await[&user.id].filters)?,
+        serde_json::to_value(Filters::default())?
+    );
+    assert!(last()["text"]
+        .as_str()
+        .unwrap()
+        .contains("Найдено видео: 5"));
+    assert!(last()["text"].as_str().unwrap().contains("Страница 1"));
+    // A disabled directory entry from an old picker cannot be selected.
+    sqlx::query("UPDATE devices SET active=false WHERE id=$1")
+        .bind(devices[0])
+        .execute(&pool)
+        .await?;
+    assert!(handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("set:device:{}:0", devices[0])
+    )
+    .await
+    .is_err());
+    let calls = sent.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|m| m["method"] == "SendMessage")
+            .count(),
+        1
+    );
+    assert!(calls
+        .iter()
+        .filter(|m| m["method"] == "EditMessageText")
+        .all(|m| m["message_id"] == panel_id));
+    server.abort();
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await?;
+    admin_pool.close().await;
+    Ok(())
+}
