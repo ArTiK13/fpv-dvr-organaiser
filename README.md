@@ -53,7 +53,7 @@ docker compose run --rm fpv-catalog --immich-smoke 'test_14.10.26/t1_o4/testpilo
 
 Файлы остаются на прежних путях. Бот не пишет в папку видео и не удаляет оригиналы. По умолчанию `REQUIRE_SYNC_RECEIPTS=true`: импорт нового файла допускается после сверки с SHA-256 receipt, атомарно записанным серверным sync-helper после проверки передачи.
 
-Контракт receipt: JSON-файлы внутри `VIDEO_ROOT/.video-sync/receipts/`, произвольное уникальное имя; содержимое:
+Поддерживаются подтверждения существующего sync-helper `VIDEO_ROOT/.video-sync/<id>.receipt.json` и JSON-файлы внутри `VIDEO_ROOT/.video-sync/receipts/` с произвольным уникальным именем. Файлы `*.intent.json` не являются подтверждениями и игнорируются. Содержимое receipt:
 
 ```json
 {

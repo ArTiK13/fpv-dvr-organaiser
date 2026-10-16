@@ -273,24 +273,37 @@ async fn hash(p: &Path) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 fn receipts(root: &Path) -> Result<HashMap<String, Receipt>> {
-    let dir = root.join(".video-sync/receipts");
-    let mut out = HashMap::new();
+    let dir = root.join(".video-sync");
+    let nested = dir.join("receipts");
+    let mut out: HashMap<String, Receipt> = HashMap::new();
     if !dir.exists() {
         return Ok(out);
     }
-    for e in WalkDir::new(dir).follow_links(false) {
+    for e in WalkDir::new(&dir).follow_links(false) {
         let e = e?;
-        if e.file_type().is_file() && e.path().extension().is_some_and(|v| v == "json") {
+        let nested_receipt =
+            e.path().starts_with(&nested) && e.path().extension().is_some_and(|v| v == "json");
+        let sync_helper_receipt = e.path().parent() == Some(dir.as_path())
+            && e.file_name().to_string_lossy().ends_with(".receipt.json");
+        if e.file_type().is_file() && (nested_receipt || sync_helper_receipt) {
             let r: Receipt = serde_json::from_slice(&std::fs::read(e.path())?)
                 .context("invalid sync receipt")?;
             if !safe_relative(&r.relative_path) {
                 bail!("unsafe receipt path");
+            }
+            if let Some(previous) = out.get(&r.relative_path) {
+                if previous.size_bytes != r.size_bytes
+                    || !previous.sha256.eq_ignore_ascii_case(&r.sha256)
+                {
+                    bail!("conflicting sync receipts for {}", r.relative_path);
+                }
             }
             out.insert(r.relative_path.clone(), r);
         }
     }
     Ok(out)
 }
+
 async fn references(pool: &PgPool) -> Result<(Vec<Device>, Vec<VideoSystem>, Vec<Pilot>)> {
     let mut ds = vec![];
     for r in sqlx::query("SELECT id,name,type FROM devices WHERE active ORDER BY id")
@@ -359,4 +372,41 @@ async fn references(pool: &PgPool) -> Result<(Vec<Device>, Vec<VideoSystem>, Vec
         });
     }
     Ok((ds, ss, ps))
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn reads_both_layouts_and_ignores_sync_intents() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let sync = root.path().join(".video-sync");
+        std::fs::create_dir_all(sync.join("receipts"))?;
+        let content =
+            r#"{"relative_path":"event/video.mp4","size_bytes":12,"sha256":"aabb","version":1}"#;
+        std::fs::write(sync.join("file.receipt.json"), content)?;
+        std::fs::write(sync.join("file.intent.json"), "not a receipt")?;
+        assert_eq!(receipts(root.path())?.len(), 1);
+        std::fs::write(sync.join("receipts/other.json"), content)?;
+        assert_eq!(receipts(root.path())?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_conflicting_receipts() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let sync = root.path().join(".video-sync");
+        std::fs::create_dir_all(sync.join("receipts"))?;
+        std::fs::write(
+            sync.join("file.receipt.json"),
+            r#"{"relative_path":"event/video.mp4","size_bytes":12,"sha256":"aabb"}"#,
+        )?;
+        std::fs::write(
+            sync.join("receipts/other.json"),
+            r#"{"relative_path":"event/video.mp4","size_bytes":13,"sha256":"ccdd"}"#,
+        )?;
+        assert!(receipts(root.path()).is_err());
+        Ok(())
+    }
 }
