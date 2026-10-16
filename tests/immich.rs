@@ -13,6 +13,7 @@ struct Mock {
     search: Value,
     requests: Vec<Value>,
     deleted: Vec<String>,
+    response_overrides: Value,
 }
 async fn search(
     State(s): State<Arc<Mutex<Mock>>>,
@@ -24,10 +25,15 @@ async fn search(
     Json(s.lock().unwrap().search.clone())
 }
 async fn share(State(s): State<Arc<Mutex<Mock>>>, Json(body): Json<Value>) -> Json<Value> {
-    s.lock().unwrap().requests.push(body.clone());
-    Json(
-        json!({"id":"77777777-7777-4777-8777-777777777777","key":"random_secret","expiresAt":body["expiresAt"]}),
-    )
+    let mut s = s.lock().unwrap();
+    s.requests.push(body.clone());
+    let mut response = json!({"id":"77777777-7777-4777-8777-777777777777","key":"random_secret","expiresAt":body["expiresAt"],
+        "allowDownload":body["allowDownload"],"allowUpload":body["allowUpload"],"showMetadata":body["showMetadata"],
+        "assets":body["assetIds"].as_array().unwrap().iter().map(|id|json!({"id":id})).collect::<Vec<_>>()});
+    if let Some(overrides) = s.response_overrides.as_object() {
+        response.as_object_mut().unwrap().extend(overrides.clone());
+    }
+    Json(response)
 }
 async fn remove(State(s): State<Arc<Mutex<Mock>>>, Path(id): Path<String>) -> StatusCode {
     s.lock().unwrap().deleted.push(id);
@@ -112,5 +118,50 @@ async fn share_flags_expiry_and_revoke() {
     assert_eq!(share.expires_at.unwrap(), expiry);
     c.revoke_share(share.id).await.unwrap();
     assert_eq!(s.lock().unwrap().deleted.len(), 1);
+    t.abort();
+}
+
+#[tokio::test]
+async fn share_metadata_can_be_enabled_for_immich_downloads() {
+    let (c, s, t) = mock().await;
+    let c = c.with_share_metadata(true);
+    c.create_share(
+        &[Uuid::new_v4()],
+        chrono::Utc::now() + chrono::Duration::days(7),
+        "metadata allowed".into(),
+    )
+    .await
+    .unwrap();
+    let request = s.lock().unwrap().requests[0].clone();
+    assert_eq!(request["showMetadata"], true);
+    assert_eq!(request["allowDownload"], true);
+    assert_eq!(request["allowUpload"], false);
+    t.abort();
+}
+
+#[tokio::test]
+async fn incompatible_share_is_revoked_instead_of_published() {
+    let (c, s, t) = mock().await;
+    let ids = [Uuid::new_v4()];
+    let expiry = chrono::Utc::now() + chrono::Duration::days(7);
+    let overrides = [
+        json!({"allowDownload":false}), // Actual Immich behavior with hidden metadata.
+        json!({"allowUpload":true}),
+        json!({"showMetadata":true}),
+        json!({"assets":[]}),
+        json!({"assets":[{"id":ids[0]},{"id":Uuid::new_v4()}]}),
+        json!({"assets":[{"id":ids[0]},{"id":"invalid"}]}),
+        json!({"expiresAt":null}),
+        json!({"expiresAt":expiry + chrono::Duration::days(1)}),
+    ];
+    for value in &overrides {
+        s.lock().unwrap().response_overrides = value.clone();
+        let error = c
+            .create_share(&ids, expiry, "invalid response".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("link revoked"));
+    }
+    assert_eq!(s.lock().unwrap().deleted.len(), overrides.len());
     t.abort();
 }

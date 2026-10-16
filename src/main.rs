@@ -23,13 +23,16 @@ async fn main() -> Result<()> {
         .await?;
     sqlx::migrate!().run(&pool).await?;
     db::bootstrap(&pool, c.bootstrap_admin_chat_id).await?;
-    let immich = Arc::new(ImmichClient::new(
-        c.immich_base_url.clone(),
-        c.immich_public_url.clone(),
-        c.immich_api_key.clone(),
-        c.immich_container_root.clone(),
-        c.immich_library_id.clone(),
-    ));
+    let immich = Arc::new(
+        ImmichClient::new(
+            c.immich_base_url.clone(),
+            c.immich_public_url.clone(),
+            c.immich_api_key.clone(),
+            c.immich_container_root.clone(),
+            c.immich_library_id.clone(),
+        )
+        .with_share_metadata(c.immich_show_metadata),
+    );
     if let Err(e) = immich.health().await {
         tracing::warn!(error=%c.redact(&e.to_string()),"Immich health check");
     }

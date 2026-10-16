@@ -13,6 +13,7 @@ pub struct ImmichClient {
     api_key: String,
     container_root: String,
     library_id: String,
+    show_metadata: bool,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct Asset {
@@ -69,7 +70,12 @@ impl ImmichClient {
             api_key: key,
             container_root: root.trim_end_matches('/').into(),
             library_id: library,
+            show_metadata: false,
         }
+    }
+    pub fn with_share_metadata(mut self, show_metadata: bool) -> Self {
+        self.show_metadata = show_metadata;
+        self
     }
     pub fn original_path(&self, relative: &str) -> Result<String> {
         if !safe_relative(relative) {
@@ -150,27 +156,13 @@ impl ImmichClient {
             if value["description"].as_str() != Some(description.as_str()) {
                 continue;
             }
-            let mut actual = value["assets"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v["id"].as_str()?.parse::<Uuid>().ok())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            actual.sort();
-            if actual != expected
-                || value["allowDownload"] != true
-                || value["allowUpload"] != false
-                || value["showMetadata"] != false
-            {
-                continue;
-            }
-            let share: ShareResponse = serde_json::from_value(value)?;
-            if share.expires_at.is_some_and(|e| e > Utc::now()) {
+            let share: ShareResponse = serde_json::from_value(value.clone())?;
+            if self.share_matches(&value, &share, &expected, expires) {
                 let url = self.share_url(&share.key);
                 return Ok((share, url));
             }
+            // Clean up an incompatible link left by a lost POST response before retrying.
+            self.revoke_share(share.id).await?;
         }
         let body = ShareRequest {
             kind: "INDIVIDUAL",
@@ -178,10 +170,10 @@ impl ImmichClient {
             expires_at: expires,
             allow_download: true,
             allow_upload: false,
-            show_metadata: false,
+            show_metadata: self.show_metadata,
             description,
         };
-        let s: ShareResponse = self
+        let value: serde_json::Value = self
             .client
             .post(format!("{}/shared-links", self.base_url))
             .header("x-api-key", &self.api_key)
@@ -191,8 +183,40 @@ impl ImmichClient {
             .error_for_status()?
             .json()
             .await?;
+        let s: ShareResponse = serde_json::from_value(value.clone())?;
+        if !self.share_matches(&value, &s, &expected, expires) {
+            self.revoke_share(s.id)
+                .await
+                .context("revoke incompatible Immich link")?;
+            bail!("Immich changed share permissions, expiry or selected assets; link revoked. Immich 3.3 requires IMMICH_SHOW_METADATA=true to allow original downloads");
+        }
         let url = self.share_url(&s.key);
         Ok((s, url))
+    }
+    fn share_matches(
+        &self,
+        value: &serde_json::Value,
+        share: &ShareResponse,
+        expected: &[Uuid],
+        expires: DateTime<Utc>,
+    ) -> bool {
+        let actual = value["assets"].as_array().and_then(|assets| {
+            assets
+                .iter()
+                .map(|a| a["id"].as_str()?.parse::<Uuid>().ok())
+                .collect::<Option<Vec<_>>>()
+        });
+        let Some(mut actual) = actual else {
+            return false;
+        };
+        actual.sort();
+        actual == expected
+            && value["allowDownload"] == true
+            && value["allowUpload"] == false
+            && value["showMetadata"] == self.show_metadata
+            && share
+                .expires_at
+                .is_some_and(|e| e > Utc::now() && e <= expires + chrono::Duration::seconds(1))
     }
     pub fn share_url(&self, key: &str) -> String {
         format!("{}/share/{}", self.public_url, key)

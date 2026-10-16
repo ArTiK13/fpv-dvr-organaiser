@@ -59,6 +59,7 @@ fn config(root: std::path::PathBuf) -> Config {
         immich_container_root: "/mnt/fpv".into(),
         immich_asset_wait_timeout: Duration::from_secs(1800),
         immich_link_ttl: Duration::from_secs(604800),
+        immich_show_metadata: false,
         telegram_bot_token: "test".into(),
         bootstrap_admin_chat_id: 7777,
         default_user_id: None,

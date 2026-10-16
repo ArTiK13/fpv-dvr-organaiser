@@ -12,6 +12,7 @@ pub struct Config {
     pub immich_container_root: String,
     pub immich_asset_wait_timeout: Duration,
     pub immich_link_ttl: Duration,
+    pub immich_show_metadata: bool,
     pub telegram_bot_token: String,
     pub bootstrap_admin_chat_id: i64,
     pub default_user_id: Option<i64>,
@@ -60,6 +61,9 @@ impl Config {
             immich_container_root: container,
             immich_asset_wait_timeout: duration_env("IMMICH_ASSET_WAIT_TIMEOUT", 1800)?,
             immich_link_ttl: duration_env("IMMICH_LINK_TTL", 604800)?,
+            immich_show_metadata: env::var("IMMICH_SHOW_METADATA")
+                .unwrap_or("false".into())
+                .parse()?,
             telegram_bot_token: secret("TELEGRAM_BOT_TOKEN")?,
             bootstrap_admin_chat_id: required("BOOTSTRAP_ADMIN_CHAT_ID")?.parse()?,
             default_user_id: env::var("DEFAULT_USER_ID")

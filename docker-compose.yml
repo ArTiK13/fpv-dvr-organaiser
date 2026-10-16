@@ -15,7 +15,8 @@ services:
     restart: unless-stopped
 
   fpv-catalog:
-    build: .
+    image: ${FPV_CATALOG_IMAGE:-fpv-dvr-organaiser-fpv-catalog:latest}
+    pull_policy: never
     env_file: .env
     environment:
       VIDEO_ROOT: /srv/fpv/sorted
