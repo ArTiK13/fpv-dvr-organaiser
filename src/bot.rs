@@ -5,13 +5,16 @@ use crate::{
     scanner,
 };
 use anyhow::{bail, Context, Result};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, sync::Arc};
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup as K},
+    types::{
+        CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup as K, KeyboardButton,
+        KeyboardMarkup,
+    },
     utils::command::BotCommands,
 };
 use tokio::sync::Mutex;
@@ -43,6 +46,18 @@ impl BotState {
 enum Command {
     #[command(description = "главное меню")]
     Start,
+    #[command(description = "показать кнопки главного меню")]
+    Menu,
+    #[command(description = "видео по текущим фильтрам")]
+    Catalog,
+    #[command(description = "выбрать фильтры кнопками")]
+    Filters,
+    #[command(description = "выбрать подписки кнопками")]
+    Subscriptions,
+    #[command(description = "настройки уведомлений")]
+    Notifications,
+    #[command(description = "меню администратора")]
+    Admin,
     #[command(description = "команды и примеры")]
     Help,
     #[command(description = "поиск; текст или JSON фильтров")]
@@ -104,6 +119,11 @@ pub async fn run(state: BotState) {
                 .filter_command::<Command>()
                 .endpoint(message),
         )
+        .branch(
+            Update::filter_message()
+                .filter_map(|msg: Message| reply_command(msg.text()?))
+                .endpoint(message),
+        )
         .branch(Update::filter_callback_query().endpoint(callback));
     let error_config = state.config.clone();
     let errors = Arc::new(move |e: teloxide::RequestError| {
@@ -159,22 +179,67 @@ fn admin(u: &User) -> Result<()> {
     }
     Ok(())
 }
+fn reply_command(text: &str) -> Option<Command> {
+    Some(match text.trim() {
+        "🔎 Поиск видео" => Command::Catalog,
+        "🎛 Фильтры" => Command::Filters,
+        "👥 Подписки" => Command::Subscriptions,
+        "🔔 Уведомления" => Command::Notifications,
+        "📤 Мои запросы" => Command::Jobs,
+        "❓ Помощь" => Command::Help,
+        "⚙️ Управление" => Command::Admin,
+        "📊 Состояние" => Command::Status,
+        "🔄 Сканировать" => Command::Scan,
+        "✈️ Аппараты" => Command::List("devices".into()),
+        "📹 Видеосистемы" => Command::List("systems".into()),
+        "👤 Пользователи" => Command::List("users".into()),
+        "📩 Заявки" => Command::Requests,
+        "🏠 Главное меню" => Command::Menu,
+        _ => return None,
+    })
+}
+fn menu_keyboard(is_admin: bool, management: bool) -> KeyboardMarkup {
+    let mut rows = if management && is_admin {
+        vec![
+            vec!["📊 Состояние", "🔄 Сканировать"],
+            vec!["✈️ Аппараты", "📹 Видеосистемы"],
+            vec!["👤 Пользователи", "📩 Заявки"],
+            vec!["🏠 Главное меню"],
+        ]
+    } else {
+        vec![
+            vec!["🔎 Поиск видео", "🎛 Фильтры"],
+            vec!["👥 Подписки", "🔔 Уведомления"],
+            vec!["📤 Мои запросы", "❓ Помощь"],
+        ]
+    };
+    if is_admin && !management {
+        rows.push(vec!["⚙️ Управление"]);
+    }
+    KeyboardMarkup::new(
+        rows.into_iter()
+            .map(|row| row.into_iter().map(KeyboardButton::new)),
+    )
+    .resize_keyboard()
+    .persistent()
+    .input_field_placeholder("Выберите действие")
+}
 async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -> Result<()> {
     let pool = &s.pool;
     match cmd {
-        Command::Start => {
-            bot.send_message(chat, "FPV-каталог. Выберите действие:")
-                .reply_markup(K::new(vec![
-                    vec![
-                        B::callback("Поиск", "search"),
-                        B::callback("Фильтры", "filters"),
-                    ],
-                    vec![
-                        B::callback("Подписки", "subscriptions"),
-                        B::callback("Выдача", "jobs"),
-                    ],
-                ]))
+        Command::Start | Command::Menu => {
+            bot.send_message(chat, "FPV-каталог. Действия доступны на клавиатуре внизу чата. /menu — вернуть главное меню.")
+                .reply_markup(menu_keyboard(u.is_admin, false))
                 .await?;
+        }
+        Command::Catalog => show_search(bot, chat, s, u).await?,
+        Command::Filters => show_filters(bot, chat).await?,
+        Command::Subscriptions => show_subscriptions(bot, chat, s, u).await?,
+        Command::Notifications => show_notifications(bot, chat, s, u).await?,
+        Command::Admin => {
+            admin(u)?;
+            bot.send_message(chat, "Управление каталогом. Выберите раздел на клавиатуре. Изменение записей описано в помощи.")
+                .reply_markup(menu_keyboard(true, true)).await?;
         }
         Command::Help => {
             let text=format!("{}\n\nПоиск: /search {{\"from\":\"2026-09-01\",\"to\":\"2026-09-30\",\"osd\":true}}\nАппарат: /device {{\"name\":\"T1\",\"type\":\"quad\",\"aliases\":[\"t1\"]}}\nСистема: /system {{\"name\":\"O4 Pro\",\"with_osd\":false,\"aliases\":[\"o4pro\"]}}\nПилот: /user {{\"telegram_id\":123456,\"nickname\":\"Kostyan\",\"aliases\":[\"kostyanbtw\"]}}\nДля редактирования добавьте поле id. Даты без дня учитывают весь месяц. Время — Москва.",Command::descriptions());
@@ -725,34 +790,25 @@ async fn handle_callback(
     u: &User,
     data: &str,
 ) -> Result<()> {
+    if let Some(value) = data.strip_prefix("notify:") {
+        handle(bot, chat, s, u, Command::Notify(value.into())).await?;
+        return show_notifications(bot, chat, s, u).await;
+    }
+    if let Some(value) = data.strip_prefix("subscription:") {
+        let id: i64 = value.parse()?;
+        db::toggle_subscription(&s.pool, u.id, id).await?;
+        return show_subscriptions(bot, chat, s, u).await;
+    }
     match data {
         "search" => return show_search(bot, chat, s, u).await,
         "next" => return handle(bot, chat, s, u, Command::Next).await,
         "jobs" => return handle(bot, chat, s, u, Command::Jobs).await,
-        "filters" => {
-            bot.send_message(chat, "Выберите фильтр. Даты задаются через /search JSON; это сбрасывает остальные фильтры.")
-                .reply_markup(K::new(vec![
-                    vec![B::callback("Аппарат", "pick:device"), B::callback("Система", "pick:system")],
-                    vec![B::callback("Пилот", "pick:pilot"), B::callback("OSD", "toggle:osd"), B::callback("Colored", "toggle:colored")],
-                    vec![B::callback("Сбросить", "reset")],
-                ])).await?;
-            return Ok(());
-        }
+        "filters" => return show_filters(bot, chat).await,
         "reset" => {
             s.sessions.lock().await.entry(u.id).or_default().filters = Filters::default();
             return show_search(bot, chat, s, u).await;
         }
-        "subscriptions" => {
-            let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id,coalesce(nickname,full_name,telegram_username,'Пилот') FROM users WHERE active AND (id=$1 OR is_public OR $2) ORDER BY id")
-                .bind(u.id).bind(u.is_admin).fetch_all(&s.pool).await?;
-            let names = rows
-                .iter()
-                .map(|(id, n)| format!("#{id}: {n}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            send_chunks(bot, chat, &format!("Доступные пилоты:\n{names}\n/subscribe ID ID — выбрать; /subscribe none — очистить\n/notify HH:MM — время; /notify off — выключить")).await?;
-            return Ok(());
-        }
+        "subscriptions" => return show_subscriptions(bot, chat, s, u).await,
         _ => {}
     }
     if let Some(nonce) = data.strip_prefix("confirm:") {
@@ -844,6 +900,43 @@ async fn handle_callback(
     } else {
         bail!("Неизвестное действие");
     }
+    Ok(())
+}
+async fn show_filters(bot: &Bot, chat: ChatId) -> Result<()> {
+    bot.send_message(chat, "Выберите фильтр. Для OSD и цветокоррекции повторное нажатие переключает: любые → да → нет. Даты можно задать командой /search из помощи.")
+        .reply_markup(K::new(vec![
+            vec![B::callback("Аппарат", "pick:device"), B::callback("Видеосистема", "pick:system")],
+            vec![B::callback("Пилот", "pick:pilot"), B::callback("OSD", "toggle:osd")],
+            vec![B::callback("Цветокоррекция", "toggle:colored"), B::callback("Сбросить", "reset")],
+            vec![B::callback("Показать видео", "search")],
+        ])).await?;
+    Ok(())
+}
+async fn show_subscriptions(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    let rows: Vec<(i64,String,bool)> = sqlx::query_as("SELECT p.id,coalesce(p.nickname,p.full_name,p.telegram_username,'Пилот'),EXISTS(SELECT 1 FROM notification_subscriptions n WHERE n.user_id=$1 AND n.pilot_id=p.id) FROM users p WHERE p.active AND (p.id=$1 OR p.is_public OR $2) ORDER BY p.id LIMIT 50")
+        .bind(u.id).bind(u.is_admin).fetch_all(&s.pool).await?;
+    let keys = rows.into_iter().map(|(id, name, selected)| {
+        vec![B::callback(
+            format!("{} {name}", if selected { "✅" } else { "⬜️" }),
+            format!("subscription:{id}"),
+        )]
+    });
+    bot.send_message(chat, "Уведомления о новых видео: нажмите на пилота, чтобы включить или выключить подписку. ✅ — подписка включена. Время дайджеста настраивается через кнопку «Уведомления».")
+        .reply_markup(K::new(keys)).await?;
+    Ok(())
+}
+async fn show_notifications(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    let (enabled, time): (bool, NaiveTime) =
+        sqlx::query_as("SELECT notifications_enabled,notification_time FROM users WHERE id=$1")
+            .bind(u.id)
+            .fetch_one(&s.pool)
+            .await?;
+    bot.send_message(chat, format!("Ежедневный дайджест: {}. Время: {} по Москве. Выберите настройку ниже. Для другого времени: /notify ЧЧ:ММ.", if enabled {"включён"} else {"выключен"}, time.format("%H:%M")))
+        .reply_markup(K::new(vec![
+            vec![B::callback("Включить", "notify:on"),B::callback("Выключить", "notify:off")],
+            vec![B::callback("06:00", "notify:06:00"),B::callback("08:00", "notify:08:00"),B::callback("10:00", "notify:10:00")],
+            vec![B::callback("12:00", "notify:12:00"),B::callback("18:00", "notify:18:00"),B::callback("21:00", "notify:21:00")],
+        ])).await?;
     Ok(())
 }
 #[derive(Deserialize)]

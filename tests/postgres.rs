@@ -82,6 +82,63 @@ async fn add(p: &PgPool, actor: i64, tg: i64, name: &str, public: bool) -> Resul
     db::save_user(p, actor, v, 7777).await
 }
 #[tokio::test]
+async fn subscription_buttons_enforce_access_and_preserve_other_cursors() -> Result<()> {
+    let Some((p, schema, admin_pool)) = pool().await? else {
+        return Ok(());
+    };
+    db::bootstrap(&p, 7777).await?;
+    let admin = db::user(&p, 7777).await?.unwrap();
+    let viewer = add(&p, admin.id, 1111, "viewer", false).await?;
+    let private = add(&p, admin.id, 2222, "private", false).await?;
+    let public = add(&p, admin.id, 3333, "public", true).await?;
+    sqlx::query("UPDATE notification_subscriptions SET created_at=now()-interval '2 days' WHERE user_id=$1 AND pilot_id=$1")
+        .bind(viewer).execute(&p).await?;
+    let original: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM notification_subscriptions WHERE user_id=$1 AND pilot_id=$1",
+    )
+    .bind(viewer)
+    .fetch_one(&p)
+    .await?;
+    assert!(db::toggle_subscription(&p, viewer, private).await.is_err());
+    db::toggle_subscription(&p, viewer, public).await?;
+    assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM notification_subscriptions WHERE user_id=$1 AND pilot_id=$2)")
+        .bind(viewer).bind(public).fetch_one(&p).await?);
+    db::toggle_subscription(&p, viewer, public).await?;
+    assert!(!sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM notification_subscriptions WHERE user_id=$1 AND pilot_id=$2)")
+        .bind(viewer).bind(public).fetch_one(&p).await?);
+    assert_eq!(
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT created_at FROM notification_subscriptions WHERE user_id=$1 AND pilot_id=$1"
+        )
+        .bind(viewer)
+        .fetch_one(&p)
+        .await?,
+        original
+    );
+    // Check the current database role even if an old menu was issued to an admin.
+    sqlx::query("UPDATE users SET is_admin=true WHERE id=$1")
+        .bind(viewer)
+        .execute(&p)
+        .await?;
+    db::toggle_subscription(&p, viewer, private).await?;
+    sqlx::query("UPDATE users SET is_admin=false WHERE id=$1")
+        .bind(viewer)
+        .execute(&p)
+        .await?;
+    assert!(db::toggle_subscription(&p, viewer, private).await.is_err());
+    sqlx::query("UPDATE users SET active=false WHERE id=$1")
+        .bind(viewer)
+        .execute(&p)
+        .await?;
+    assert!(db::toggle_subscription(&p, viewer, viewer).await.is_err());
+    p.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await?;
+    admin_pool.close().await;
+    Ok(())
+}
+#[tokio::test]
 async fn catalog_lifecycle_permissions_links_and_notifications() -> Result<()> {
     let Some((p, schema, admin_pool)) = pool().await? else {
         return Ok(());

@@ -20,6 +20,39 @@ pub async fn user(pool: &PgPool, tg: i64) -> Result<Option<User>> {
     .fetch_optional(pool)
     .await?)
 }
+/// Change one subscription without resetting other pilots' notification cursors.
+pub async fn toggle_subscription(pool: &PgPool, user_id: i64, pilot_id: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let active: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id=$1 AND active FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if active.is_none() {
+        bail!("Доступ закрыт");
+    }
+    let allowed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users u JOIN users p ON p.id=$2 WHERE u.id=$1 AND p.active AND (p.id=u.id OR p.is_public OR u.is_admin))")
+        .bind(user_id).bind(pilot_id).fetch_one(&mut *tx).await?;
+    if !allowed {
+        bail!("Недоступный пилот");
+    }
+    let removed =
+        sqlx::query("DELETE FROM notification_subscriptions WHERE user_id=$1 AND pilot_id=$2")
+            .bind(user_id)
+            .bind(pilot_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    if removed == 0 {
+        sqlx::query("INSERT INTO notification_subscriptions(user_id,pilot_id) VALUES($1,$2)")
+            .bind(user_id)
+            .bind(pilot_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
 pub async fn bootstrap(pool: &PgPool, tg: i64) -> Result<()> {
     let existing = user(pool, tg).await?;
     sqlx::query("INSERT INTO users(telegram_id,full_name,is_admin) VALUES($1,'Главный администратор',true) ON CONFLICT(telegram_id) DO UPDATE SET is_admin=true,active=true").bind(tg).execute(pool).await?;
