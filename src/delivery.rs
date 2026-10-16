@@ -58,7 +58,7 @@ pub async fn tick(pool: &PgPool, c: &Config, immich: &ImmichClient, bot: &Bot) -
                     &format!("Не завершена выдача {}: {}", j.id, error),
                 )
                 .await?;
-                let _=bot.send_message(ChatId(j.chat_id),format!("Выдача {} не завершена. Immich мог ещё не проиндексировать файл. Попробуйте позже; администратор может использовать fallback.",j.id)).await;
+                let _=bot.send_message(ChatId(j.chat_id),"Не удалось завершить выдачу. Immich мог ещё не обработать файл. Попробуйте позже. Прогресс доступен через «Мои запросы».").await;
             } else {
                 let seconds = (15_i64 * 2_i64.pow((j.attempts as u32).min(5))).min(300);
                 sqlx::query("UPDATE delivery_jobs SET state='waiting_for_immich',wait_started_at=coalesce(wait_started_at,now()),error=$2,next_attempt_at=now()+($3 * interval '1 second') WHERE id=$1 AND state<>'cancelled'").bind(j.id).bind(&error).bind(seconds as f64).execute(pool).await?;
@@ -247,7 +247,7 @@ async fn process(
     .bind(j.id)
     .execute(pool)
     .await?;
-    bot.send_message(ChatId(j.chat_id), format!("Выдача {} завершена.", j.id))
+    bot.send_message(ChatId(j.chat_id), "✅ Выдача видео завершена.")
         .await?;
     Ok(())
 }

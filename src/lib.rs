@@ -7,4 +7,5 @@ pub mod downloads;
 pub mod immich;
 pub mod media;
 pub mod notifications;
+pub mod presentation;
 pub mod scanner;

@@ -185,7 +185,7 @@ pub async fn enqueue(pool: &PgPool, u: &User, chat: i64, ids: &[i64], mode: &str
     tx.commit().await?;
     Ok(id)
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserInput {
     pub id: Option<i64>,
@@ -238,6 +238,16 @@ pub async fn save_user(pool: &PgPool, actor: i64, v: UserInput, bootstrap: i64) 
     let is_admin = v.is_admin;
     let new_user = v.id.is_none();
     let mut tx = pool.begin().await?;
+    // Recheck the actor's current role at the write boundary, including wizard submissions.
+    let allowed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND active AND is_admin)",
+    )
+    .bind(actor)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !allowed {
+        bail!("Требуются права администратора");
+    }
     let id: i64 = if let Some(id) = v.id {
         sqlx::query_scalar("UPDATE users SET telegram_id=$2,full_name=$3,nickname=$4,telegram_username=$5,is_admin=$6,is_public=$7,active=true WHERE id=$1 RETURNING id").bind(id).bind(v.telegram_id).bind(v.full_name).bind(v.nickname).bind(v.telegram_username).bind(v.is_admin).bind(v.is_public).fetch_one(&mut *tx).await?
     } else {

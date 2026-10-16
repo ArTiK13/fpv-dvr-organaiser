@@ -1,11 +1,14 @@
+mod management;
+mod user_form;
 use crate::{
     config::Config,
     db::{self, Filters, User},
     downloads::{self, DownloadState},
-    scanner,
+    presentation as ui, scanner,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, NaiveTime};
+use management::*;
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, sync::Arc};
@@ -18,6 +21,7 @@ use teloxide::{
     utils::command::BotCommands,
 };
 use tokio::sync::Mutex;
+use user_form::{Step, UserForm};
 use uuid::Uuid;
 #[derive(Default, Clone)]
 struct Session {
@@ -25,6 +29,7 @@ struct Session {
     selection: Vec<i64>,
     mode: String,
     nonce: Option<Uuid>,
+    user_form: Option<UserForm>,
 }
 #[derive(Clone)]
 pub struct BotState {
@@ -100,6 +105,8 @@ enum Command {
     Delete(String),
     #[command(description = "заявки, только админ")]
     Requests,
+    #[command(description = "добавить пользователя пошагово")]
+    Adduser,
     #[command(description = "отклонить заявку: Telegram ID, админ")]
     Reject(i64),
     #[command(description = "пилот по умолчанию: внутренний ID или none, админ")]
@@ -124,6 +131,7 @@ pub async fn run(state: BotState) {
                 .filter_map(|msg: Message| reply_command(msg.text()?))
                 .endpoint(message),
         )
+        .branch(Update::filter_message().endpoint(free_message))
         .branch(Update::filter_callback_query().endpoint(callback));
     let error_config = state.config.clone();
     let errors = Arc::new(move |e: teloxide::RequestError| {
@@ -158,18 +166,8 @@ async fn message(bot: Bot, msg: Message, cmd: Command, s: BotState) -> ResponseR
 }.await;
     if let Err(e) = result {
         tracing::warn!(error=%s.config.redact(&e.to_string()),"bot command failed");
-        bot.send_message(
-            msg.chat.id,
-            format!(
-                "Ошибка: {}",
-                s.config
-                    .redact(&e.to_string())
-                    .chars()
-                    .take(1500)
-                    .collect::<String>()
-            ),
-        )
-        .await?;
+        bot.send_message(msg.chat.id, format!("Ошибка: {}", ui::error_message(&e)))
+            .await?;
     }
     Ok(())
 }
@@ -193,7 +191,7 @@ fn reply_command(text: &str) -> Option<Command> {
         "✈️ Аппараты" => Command::List("devices".into()),
         "📹 Видеосистемы" => Command::List("systems".into()),
         "👤 Пользователи" => Command::List("users".into()),
-        "📩 Заявки" => Command::Requests,
+        "📩 Заявки" | "➕ Добавить пользователя" => Command::Adduser,
         "🏠 Главное меню" => Command::Menu,
         _ => return None,
     })
@@ -203,7 +201,7 @@ fn menu_keyboard(is_admin: bool, management: bool) -> KeyboardMarkup {
         vec![
             vec!["📊 Состояние", "🔄 Сканировать"],
             vec!["✈️ Аппараты", "📹 Видеосистемы"],
-            vec!["👤 Пользователи", "📩 Заявки"],
+            vec!["👤 Пользователи", "➕ Добавить пользователя"],
             vec!["🏠 Главное меню"],
         ]
     } else {
@@ -226,6 +224,12 @@ fn menu_keyboard(is_admin: bool, management: bool) -> KeyboardMarkup {
 }
 async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -> Result<()> {
     let pool = &s.pool;
+    if !matches!(
+        cmd,
+        Command::Adduser | Command::User(_) | Command::Cancel(_)
+    ) {
+        s.sessions.lock().await.entry(u.id).or_default().user_form = None;
+    }
     match cmd {
         Command::Start | Command::Menu => {
             bot.send_message(chat, "FPV-каталог. Действия доступны на клавиатуре внизу чата. /menu — вернуть главное меню.")
@@ -236,14 +240,28 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         Command::Filters => show_filters(bot, chat).await?,
         Command::Subscriptions => show_subscriptions(bot, chat, s, u).await?,
         Command::Notifications => show_notifications(bot, chat, s, u).await?,
+        Command::Adduser => {
+            admin(u)?;
+            start_user_form(bot, chat, s, u, None).await?;
+        }
         Command::Admin => {
             admin(u)?;
-            bot.send_message(chat, "Управление каталогом. Выберите раздел на клавиатуре. Изменение записей описано в помощи.")
+            bot.send_message(chat, "Управление каталогом. Выберите раздел на клавиатуре. Пользователей можно добавлять и редактировать пошагово.")
                 .reply_markup(menu_keyboard(true, true)).await?;
         }
         Command::Help => {
-            let text=format!("{}\n\nПоиск: /search {{\"from\":\"2026-09-01\",\"to\":\"2026-09-30\",\"osd\":true}}\nАппарат: /device {{\"name\":\"T1\",\"type\":\"quad\",\"aliases\":[\"t1\"]}}\nСистема: /system {{\"name\":\"O4 Pro\",\"with_osd\":false,\"aliases\":[\"o4pro\"]}}\nПилот: /user {{\"telegram_id\":123456,\"nickname\":\"Kostyan\",\"aliases\":[\"kostyanbtw\"]}}\nДля редактирования добавьте поле id. Даты без дня учитывают весь месяц. Время — Москва.",Command::descriptions());
-            bot.send_message(chat, text).await?;
+            bot.send_message(chat, "Действия доступны на клавиатуре внизу чата.
+
+🔎 Поиск видео — список по текущим фильтрам.
+🎛 Фильтры — аппарат, видеосистема, пилот, OSD и цветокоррекция.
+👥 Подписки — о чьих видео получать новости.
+🔔 Уведомления — включение и время ежедневного дайджеста.
+📤 Мои запросы — прогресс отправки видео.
+
+В карточке видео выберите отправку видео, файла или ссылки Immich. Большие файлы доступны по ссылке.
+
+Администратор добавляет пилотов через «Управление» → «Добавить пользователя», а редактирует через «Пользователи».
+/menu — вернуть кнопки. /cancel — отменить заполнение формы.").await?;
         }
         Command::Search(value) => {
             let f = if value.trim().starts_with('{') {
@@ -309,36 +327,56 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
             let job = db::enqueue(pool, u, chat.0, &session.selection, &session.mode).await?;
             bot.send_message(
                 chat,
-                format!("Запрос {job} принят. /jobs — прогресс; /cancel {job} — остановить."),
+                "✅ Запрос принят. Прогресс доступен через «Мои запросы».".to_string(),
             )
+            .reply_markup(job_buttons(job))
             .await?;
         }
         Command::Jobs => {
-            let jobs=sqlx::query("SELECT id,state,total_count,completed_count FROM delivery_jobs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10").bind(u.id).fetch_all(pool).await?;
-            let text = jobs
-                .iter()
-                .map(|r| {
-                    format!(
-                        "{}: {} {}/{}",
-                        r.get::<Uuid, _>("id"),
-                        r.get::<String, _>("state"),
-                        r.get::<i32, _>("completed_count"),
-                        r.get::<i32, _>("total_count")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            bot.send_message(
-                chat,
-                if text.is_empty() {
-                    "Нет запросов"
+            let jobs = sqlx::query("SELECT id,state,mode,total_count,completed_count,created_at FROM delivery_jobs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10").bind(u.id).fetch_all(pool).await?;
+            if jobs.is_empty() {
+                bot.send_message(
+                    chat,
+                    "📤 Запросов на выдачу пока нет. Найдите видео и выберите способ отправки.",
+                )
+                .await?;
+            }
+            for job in jobs {
+                let id: Uuid = job.get("id");
+                let state: String = job.get("state");
+                let created: chrono::DateTime<chrono::Utc> = job.get("created_at");
+                let text = format!(
+                    "📤 {}\nСпособ: {}\nСостояние: {}\nГотово: {} из {} видео",
+                    created
+                        .with_timezone(&chrono_tz::Europe::Moscow)
+                        .format("%d.%m.%Y %H:%M"),
+                    ui::delivery_mode(&job.get::<String, _>("mode")),
+                    ui::state(&state),
+                    job.get::<i32, _>("completed_count"),
+                    job.get::<i32, _>("total_count")
+                );
+                let keys = if ["pending", "running", "waiting_for_immich"].contains(&state.as_str())
+                {
+                    vec![vec![B::callback(
+                        "Остановить выдачу",
+                        format!("canceljob:{id}"),
+                    )]]
                 } else {
-                    &text
-                },
-            )
-            .await?;
+                    vec![]
+                };
+                bot.send_message(chat, text)
+                    .reply_markup(K::new(keys))
+                    .await?;
+            }
         }
         Command::Cancel(id) => {
+            if id.trim().is_empty() {
+                s.sessions.lock().await.entry(u.id).or_default().user_form = None;
+                bot.send_message(chat, "Заполнение отменено.")
+                    .reply_markup(menu_keyboard(u.is_admin, u.is_admin))
+                    .await?;
+                return Ok(());
+            }
             let id = Uuid::parse_str(id.trim())?;
             sqlx::query("UPDATE delivery_jobs SET state='cancelled' WHERE id=$1 AND user_id=$2 AND state NOT IN ('done','failed')").bind(id).bind(u.id).execute(pool).await?;
             sqlx::query("UPDATE immich_shared_links SET revoke_requested=true WHERE job_id=$1 AND user_id=$2 AND NOT sent").bind(id).bind(u.id).execute(pool).await?;
@@ -414,8 +452,8 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
                     .fetch_one(pool)
                     .await?;
             let media: Vec<(String,String)> = sqlx::query_as("SELECT relative_path,error FROM media_errors WHERE resolved_at IS NULL ORDER BY first_seen_at LIMIT 5").fetch_all(pool).await?;
-            let alerts: Vec<String> = sqlx::query_scalar(
-                "SELECT message FROM system_alerts WHERE active ORDER BY created_at LIMIT 10",
+            let alerts: Vec<(String, String)> = sqlx::query_as(
+                "SELECT key,message FROM system_alerts WHERE active ORDER BY created_at LIMIT 10",
             )
             .fetch_all(pool)
             .await?;
@@ -424,12 +462,12 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
             )
             .fetch_all(pool)
             .await?;
-            let text = format!("Видео: {}\nВыдача: {}\nПроблемы классификации: {count}\n{}\nОшибки файлов: {media_count}\n{}\nСистемные проблемы:\n{}",
-                states.iter().map(|(s,n)|format!("{s}: {n}")).collect::<Vec<_>>().join(", "),
-                jobs.iter().map(|(s,n)|format!("{s}: {n}")).collect::<Vec<_>>().join(", "),
-                issues.iter().map(|(id,p,e)|format!("#{id} {p}: {e}")).collect::<Vec<_>>().join("\n"),
-                media.iter().map(|(p,e)|format!("{p}: {e}")).collect::<Vec<_>>().join("\n"),
-                alerts.join("\n"));
+            let text = format!("📊 Состояние каталога\n\nВидео: {}\nВыдача: {}\nПроблемы классификации: {count}\n{}\nОшибки файлов: {media_count}\n{}\nСистемные проблемы:\n{}",
+                states.iter().map(|(s,n)|format!("{}: {n}",ui::state(s))).collect::<Vec<_>>().join(", "),
+                jobs.iter().map(|(s,n)|format!("{}: {n}",ui::state(s))).collect::<Vec<_>>().join(", "),
+                issues.iter().map(|(id,p,e)|format!("Видео №{id}: {}\n{p}",ui::issue(e))).collect::<Vec<_>>().join("\n"),
+                media.iter().map(|(p,_e)|format!("Не удалось прочитать параметры: {p}")).collect::<Vec<_>>().join("\n"),
+                alerts.iter().map(|(k,m)|ui::alert(k,m)).collect::<Vec<_>>().join("\n"));
             send_chunks(bot, chat, &s.config.redact(&text)).await?;
         }
         Command::Scan => {
@@ -442,21 +480,33 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
             tokio::spawn(async move {
                 let text = match scanner::scan_once(&p, &c).await {
                     Ok(n) => format!("Сканирование: {n} видео"),
-                    Err(e) => format!("Сканирование: {}", c.redact(&e.to_string())),
+                    Err(e) => {
+                        tracing::warn!(error=%c.redact(&e.to_string()), "manual scan failed");
+                        "Не удалось обновить каталог. Проверьте доступ к папке видео или попробуйте позже.".into()
+                    }
                 };
                 let _ = b.send_message(chat, text).await;
             });
         }
-        Command::User(json) => {
+        Command::User(value) => {
             admin(u)?;
-            let id = db::save_user(
-                pool,
-                u.id,
-                serde_json::from_str(&json)?,
-                s.config.bootstrap_admin_chat_id,
-            )
-            .await?;
-            saved(bot, chat, s, id).await?;
+            if !value.trim().starts_with('{') {
+                let tg = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(user_form::parse_id(&value)?)
+                };
+                start_user_form(bot, chat, s, u, tg).await?;
+            } else {
+                let id = db::save_user(
+                    pool,
+                    u.id,
+                    serde_json::from_str(&value)?,
+                    s.config.bootstrap_admin_chat_id,
+                )
+                .await?;
+                saved(bot, chat, s, id).await?;
+            }
         }
         Command::Device(json) => {
             admin(u)?;
@@ -474,55 +524,7 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         }
         Command::List(kind) => {
             admin(u)?;
-            let text = match kind.trim() {
-                "users" => {
-                    let rows = sqlx::query(
-                        "SELECT id,row_to_json(users)::text AS data FROM users ORDER BY id",
-                    )
-                    .fetch_all(pool)
-                    .await?;
-                    rows.iter()
-                        .take(15)
-                        .map(|r| r.get::<String, _>("data"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                "devices" => {
-                    let rows=sqlx::query("SELECT d.id,d.name,d.type,d.active,coalesce(array_agg(a.alias) FILTER (WHERE a.alias IS NOT NULL),'{}') AS aliases FROM devices d LEFT JOIN device_aliases a ON a.device_id=d.id GROUP BY d.id ORDER BY d.id LIMIT 20").fetch_all(pool).await?;
-                    rows.iter()
-                        .map(|r| {
-                            format!(
-                                "#{} {} {} {:?}",
-                                r.get::<i64, _>("id"),
-                                r.get::<String, _>("name"),
-                                r.get::<String, _>("type"),
-                                r.get::<Vec<String>, _>("aliases")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                "systems" => {
-                    let rows = sqlx::query(
-                        "SELECT id,name,with_osd FROM video_systems ORDER BY id LIMIT 20",
-                    )
-                    .fetch_all(pool)
-                    .await?;
-                    rows.iter()
-                        .map(|r| {
-                            format!(
-                                "#{} {} OSD={}",
-                                r.get::<i64, _>("id"),
-                                r.get::<String, _>("name"),
-                                r.get::<bool, _>("with_osd")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                _ => bail!("users/devices/systems"),
-            };
-            send_chunks(bot, chat, &text).await?;
+            show_directory(bot, chat, s, &kind).await?;
         }
         Command::Delete(v) => {
             admin(u)?;
@@ -551,18 +553,7 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         }
         Command::Requests => {
             admin(u)?;
-            let rows:Vec<(i64,Option<String>,Option<String>)>=sqlx::query_as("SELECT telegram_id,username,display_name FROM access_requests WHERE resolved_at IS NULL LIMIT 20").fetch_all(pool).await?;
-            bot.send_message(
-                chat,
-                format!(
-                    "Заявки:\n{}\nДобавление: /user {{\"telegram_id\":ID,\"nickname\":\"имя\"}}",
-                    rows.iter()
-                        .map(|(id, name, display)| format!("{id} {name:?} {display:?}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            )
-            .await?;
+            start_user_form(bot, chat, s, u, None).await?;
         }
         Command::Reject(id) => {
             admin(u)?;
@@ -665,7 +656,7 @@ async fn prepare(
     let nonce = Uuid::new_v4();
     session.nonce = Some(nonce);
     drop(sessions);
-    bot.send_message(chat,format!("Выбрано {count} видео ({:.2} ГБ). Способ: {mode}. Большие файлы — Immich. Подтвердите выдачу.",bytes as f64/1e9)).reply_markup(K::new(vec![vec![B::callback("Подтвердить",format!("confirm:{nonce}")),B::callback("Отменить",format!("discard:{nonce}"))]])).await?;
+    bot.send_message(chat,format!("Выбрано видео: {count}\nОбщий размер: {}\nСпособ: {}\n\nБольшие файлы будут доступны по ссылке Immich. Подтвердите отправку.",ui::size(bytes),ui::delivery_mode(mode))).reply_markup(K::new(vec![vec![B::callback("Подтвердить",format!("confirm:{nonce}")),B::callback("Отменить",format!("discard:{nonce}"))]])).await?;
     Ok(())
 }
 async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
@@ -701,10 +692,10 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
     bot.send_message(
         chat,
         format!(
-            "Найдено: {n}, {:.2} ГБ. Страница {}\nФильтры: {}",
-            bytes as f64 / 1e9,
+            "🔎 Найдено видео: {n}\nОбщий размер: {}\nСтраница {}\n\n{}",
+            ui::size(bytes),
             f.page + 1,
-            serde_json::to_string(&f)?
+            filter_summary(&s.pool, u, &f).await?
         ),
     )
     .reply_markup(K::new(keyboard))
@@ -726,7 +717,10 @@ async fn show_info(bot: &Bot, chat: ChatId, s: &BotState, u: &User, id: i64) -> 
         );
     }
     if u.is_admin {
-        keys.push(vec![B::callback("Fallback", format!("fallback:{id}"))]);
+        keys.push(vec![B::callback(
+            "Резервная ссылка",
+            format!("fallback:{id}"),
+        )]);
     }
     let duration = v
         .duration_ms
@@ -777,8 +771,8 @@ async fn callback(bot: Bot, q: CallbackQuery, s: BotState) -> ResponseResult<()>
     }
     .await;
     if let Err(e) = result {
-        let text = s.config.redact(&e.to_string());
-        bot.send_message(chat, format!("Ошибка: {text}")).await?;
+        tracing::warn!(error=%s.config.redact(&e.to_string()), "bot action failed");
+        bot.send_message(chat, ui::error_message(&e)).await?;
     }
     Ok(())
 }
@@ -790,6 +784,28 @@ async fn handle_callback(
     u: &User,
     data: &str,
 ) -> Result<()> {
+    if data == "newuser" {
+        admin(u)?;
+        return start_user_form(bot, chat, s, u, None).await;
+    }
+    if let Some(page) = data.strip_prefix("userspage:") {
+        admin(u)?;
+        return show_users(bot, chat, s, page.parse::<u32>()?.min(1_000_000)).await;
+    }
+    if data.starts_with("uf:") {
+        return user_form_callback(bot, chat, s, u, data).await;
+    }
+    if let Some(value) = data.strip_prefix("adduser:") {
+        admin(u)?;
+        return start_user_form(bot, chat, s, u, Some(user_form::parse_id(value)?)).await;
+    }
+    if let Some(value) = data.strip_prefix("edituser:") {
+        admin(u)?;
+        return edit_user_form(bot, chat, s, u, value.parse()?).await;
+    }
+    if let Some(value) = data.strip_prefix("canceljob:") {
+        return handle(bot, chat, s, u, Command::Cancel(value.into())).await;
+    }
     if let Some(value) = data.strip_prefix("notify:") {
         handle(bot, chat, s, u, Command::Notify(value.into())).await?;
         return show_notifications(bot, chat, s, u).await;
@@ -829,8 +845,9 @@ async fn handle_callback(
         let id = db::enqueue(&s.pool, u, chat.0, &selection.selection, &selection.mode).await?;
         bot.send_message(
             chat,
-            format!("Запрос {id} принят. /jobs — прогресс; /cancel {id} — остановить."),
+            "✅ Запрос принят. Прогресс доступен через «Мои запросы».".to_string(),
         )
+        .reply_markup(job_buttons(id))
         .await?;
     } else if let Some(nonce) = data.strip_prefix("discard:") {
         let expected = Uuid::parse_str(nonce)?;
@@ -1046,13 +1063,7 @@ async fn saved(bot: &Bot, chat: ChatId, s: &BotState, id: i64) -> Result<()> {
         format!("Сохранено, ID {id}. Переклассификация запущена."),
     )
     .await?;
-    let p = s.pool.clone();
-    let c = s.config.clone();
-    tokio::spawn(async move {
-        if let Err(e) = scanner::scan_once(&p, &c).await {
-            tracing::warn!(error=%c.redact(&e.to_string()),"reclassification");
-        }
-    });
+    reclassify(s);
     Ok(())
 }
 async fn send_chunks(bot: &Bot, chat: ChatId, text: &str) -> Result<()> {
@@ -1078,9 +1089,72 @@ fn take_selection(session: &mut Session, expected: Option<Uuid>) -> Result<Sessi
         selection: std::mem::take(&mut session.selection),
         mode: session.mode.clone(),
         nonce: session.nonce.take(),
+        user_form: None,
     };
     Ok(selected)
 }
+
+fn job_buttons(id: Uuid) -> K {
+    K::new(vec![vec![
+        B::callback("Прогресс", "jobs"),
+        B::callback("Остановить", format!("canceljob:{id}")),
+    ]])
+}
+async fn filter_summary(pool: &PgPool, u: &User, f: &Filters) -> Result<String> {
+    let mut parts = vec![];
+    if f.from.is_some() || f.to.is_some() {
+        parts.push(format!(
+            "Дата: {} — {}",
+            f.from
+                .map(|d| d.format("%d.%m.%Y").to_string())
+                .unwrap_or("с начала архива".into()),
+            f.to.map(|d| d.format("%d.%m.%Y").to_string())
+                .unwrap_or("до конца архива".into())
+        ));
+    }
+    if let Some(id) = f.device {
+        let name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+        parts.push(format!("Аппарат: {}", name.as_deref().unwrap_or("удалён")));
+    }
+    if let Some(id) = f.system {
+        let name: Option<String> = sqlx::query_scalar("SELECT name FROM video_systems WHERE id=$1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+        parts.push(format!(
+            "Видеосистема: {}",
+            name.as_deref().unwrap_or("удалена")
+        ));
+    }
+    if let Some(id) = f.pilot {
+        let name: Option<String> = sqlx::query_scalar("SELECT coalesce(nickname,full_name,telegram_username,'Пилот') FROM users WHERE id=$1 AND active AND (id=$2 OR is_public OR $3)").bind(id).bind(u.id).bind(u.is_admin).fetch_optional(pool).await?;
+        parts.push(format!(
+            "Пилот: {}",
+            name.as_deref().unwrap_or("недоступен")
+        ));
+    }
+    if let Some(value) = f.osd {
+        parts.push(format!("OSD: {}", if value { "есть" } else { "нет" }));
+    }
+    if let Some(value) = f.colored {
+        parts.push(format!(
+            "Цветокоррекция: {}",
+            if value { "есть" } else { "нет" }
+        ));
+    }
+    if let Some(value) = &f.text {
+        parts.push(format!("Поиск по названию: {value}"));
+    }
+    Ok(if parts.is_empty() {
+        "Показаны все доступные вам видео.".into()
+    } else {
+        format!("Выбраны фильтры:\n{}", parts.join("\n"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,3 +1175,6 @@ mod tests {
         assert!(take_selection(&mut s, Some(nonce)).is_err());
     }
 }
+
+#[cfg(test)]
+mod flow_tests;

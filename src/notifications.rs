@@ -127,7 +127,12 @@ async fn system(pool: &PgPool, bot: &Bot, r: &Recipient) -> Result<()> {
     }
     let details = alerts
         .iter()
-        .map(|(_, m)| m.chars().take(160).collect::<String>())
+        .map(|(key, m)| {
+            crate::presentation::alert(key, m)
+                .chars()
+                .take(160)
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n");
     bot.send_message(
