@@ -1,0 +1,4 @@
+# Workstation/CI only. Never use this override on Orange Pi.
+services:
+  fpv-catalog:
+    build: .

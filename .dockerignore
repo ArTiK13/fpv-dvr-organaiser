@@ -1,0 +1,15 @@
+.git
+.agents
+.codex
+.aws
+.env
+.immich
+.tg-bot
+.env.*
+!.env.example
+target
+tests
+*.mp4
+*.MP4
+*.mov
+*.MOV

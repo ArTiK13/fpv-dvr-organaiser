@@ -1,0 +1,10 @@
+# Workstation only: reuse an already trusted runtime image with ffmpeg/CA installed.
+# Useful for cross-compiled updates without executing ARM64 programs on x86.
+# Pass an explicit base tag/digest with --build-arg RUNTIME_IMAGE=...
+# Set the source binary's mode to 0555 before building; plain COPY also supports
+# workstation Docker installations using the legacy builder.
+ARG RUNTIME_IMAGE=fpv-catalog-runtime:bookworm-arm64
+FROM ${RUNTIME_IMAGE}
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.revision=$VCS_REF
+COPY fpv-catalog-bot /usr/local/bin/fpv-catalog-bot

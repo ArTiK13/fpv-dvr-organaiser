@@ -1,0 +1,21 @@
+name: ARM64 deployment image
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image on the GitHub runner
+        run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" -t fpv-dvr-organaiser-fpv-catalog:latest .
+      - name: Export image
+        run: docker save fpv-dvr-organaiser-fpv-catalog:latest | gzip > fpv-catalog-arm64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fpv-catalog-arm64
+          path: fpv-catalog-arm64.tar.gz
+          compression-level: 0
+          retention-days: 7

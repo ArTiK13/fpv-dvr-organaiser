@@ -1,0 +1,10 @@
+# Build context must contain the ARM64 or AMD64 release binary as fpv-catalog-bot.
+# Compile it against Debian Bookworm (glibc 2.36) or an older compatible sysroot.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.revision=$VCS_REF
+COPY --chmod=0555 fpv-catalog-bot /usr/local/bin/fpv-catalog-bot
+USER 10001:10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/fpv-catalog-bot"]
