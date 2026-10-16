@@ -19,7 +19,12 @@ struct Job {
     attempts: i32,
 }
 pub async fn run(pool: PgPool, c: Arc<Config>, immich: Arc<ImmichClient>) {
-    let bot = Bot::new(c.telegram_bot_token.clone());
+    // teloxide's default 17-second timeout also covers the entire multipart upload.
+    let client = teloxide::net::default_reqwest_settings()
+        .timeout(c.telegram_upload_timeout)
+        .build()
+        .expect("Telegram upload HTTP client");
+    let bot = Bot::with_client(c.telegram_bot_token.clone(), client);
     loop {
         if let Err(e) = tick(&pool, &c, &immich, &bot).await {
             warn!(error=%c.redact(&e.to_string()),"delivery worker");

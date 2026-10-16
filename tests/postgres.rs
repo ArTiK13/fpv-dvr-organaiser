@@ -67,6 +67,7 @@ fn config(root: std::path::PathBuf) -> Config {
         bind_addr: "127.0.0.1:0".into(),
         fallback_base_url: Some("https://fpv.example".into()),
         telegram_limit: 49_000_000,
+        telegram_upload_timeout: Duration::from_secs(600),
         share_chunk_size: 500,
         require_receipts: false,
         stable_seconds: 0,

@@ -20,6 +20,7 @@ pub struct Config {
     pub bind_addr: String,
     pub fallback_base_url: Option<String>,
     pub telegram_limit: u64,
+    pub telegram_upload_timeout: Duration,
     pub share_chunk_size: usize,
     pub require_receipts: bool,
     pub stable_seconds: u64,
@@ -75,6 +76,7 @@ impl Config {
             bind_addr: env::var("BIND_ADDR").unwrap_or("0.0.0.0:8080".into()),
             fallback_base_url: env::var("FALLBACK_BASE_URL").ok().filter(|v| !v.is_empty()),
             telegram_limit: number("TELEGRAM_MAX_BYTES", 49_000_000)?,
+            telegram_upload_timeout: duration_env("TELEGRAM_UPLOAD_TIMEOUT", 600)?,
             share_chunk_size: number("IMMICH_SHARE_CHUNK_SIZE", 500)?,
             require_receipts: env::var("REQUIRE_SYNC_RECEIPTS")
                 .unwrap_or("true".into())
@@ -87,7 +89,11 @@ impl Config {
                 .unwrap_or("true".into())
                 .parse()?,
         };
-        if c.scan_interval.is_zero() || c.share_chunk_size == 0 || c.immich_link_ttl.is_zero() {
+        if c.scan_interval.is_zero()
+            || c.share_chunk_size == 0
+            || c.immich_link_ttl.is_zero()
+            || c.telegram_upload_timeout.is_zero()
+        {
             bail!("interval, chunk size and TTL must be positive");
         }
         uuid::Uuid::parse_str(&c.immich_library_id).context("IMMICH_LIBRARY_ID must be UUID")?;
