@@ -3,6 +3,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+ARG CARGO_BUILD_JOBS=2
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

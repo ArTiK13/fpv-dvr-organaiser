@@ -3,6 +3,8 @@
 .codex
 .aws
 .env
+.immich
+.tg-bot
 .env.*
 !.env.example
 target

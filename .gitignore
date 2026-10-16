@@ -24,4 +24,6 @@ rustc-ice-*.txt
 #.idea/
 
 .env
+.immich
+.tg-bot
 *.local
