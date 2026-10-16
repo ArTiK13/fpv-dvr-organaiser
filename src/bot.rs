@@ -1,4 +1,5 @@
 mod management;
+mod panels;
 mod user_form;
 use crate::{
     config::Config,
@@ -9,6 +10,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, NaiveTime};
 use management::*;
+use panels::{finish_panel, show_panel, PanelKind};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, sync::Arc};
@@ -36,6 +38,7 @@ pub struct BotState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     sessions: Arc<Mutex<HashMap<i64, Session>>>,
+    panels: panels::Panels,
 }
 impl BotState {
     pub fn new(pool: PgPool, config: Arc<Config>) -> Self {
@@ -43,6 +46,7 @@ impl BotState {
             pool,
             config,
             sessions: Arc::default(),
+            panels: Default::default(),
         }
     }
 }
@@ -157,13 +161,26 @@ async fn message(bot: Bot, msg: Message, cmd: Command, s: BotState) -> ResponseR
         return Ok(());
     };
     let tg = from.id.0 as i64;
-    let result=async{
- let Some(u)=db::user(&s.pool,tg).await?.filter(|u|u.active)else{
-  if matches!(cmd,Command::Start){sqlx::query("INSERT INTO access_requests(telegram_id,username,display_name) VALUES($1,$2,$3) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,display_name=EXCLUDED.display_name,resolved_at=NULL,requested_at=now()").bind(tg).bind(&from.username).bind(from.first_name.clone()).execute(&s.pool).await?;bot.send_message(msg.chat.id,"Заявка сохранена. Администратор должен выдать доступ. После добавления нажмите /start.").await?;}
-  else{bot.send_message(msg.chat.id,"Доступ закрыт. /start — подать заявку.").await?;}return Ok(());
- };
- handle(&bot,msg.chat.id,&s,&u,cmd).await
-}.await;
+    let result: Result<()> = async {
+        let Some(u) = db::user(&s.pool, tg).await?.filter(|u| u.active) else {
+            if matches!(cmd, Command::Start) {
+                sqlx::query("INSERT INTO access_requests(telegram_id,username,display_name) VALUES($1,$2,$3) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,display_name=EXCLUDED.display_name,resolved_at=NULL,requested_at=now()")
+                    .bind(tg).bind(&from.username).bind(&from.first_name).execute(&s.pool).await?;
+                bot.send_message(msg.chat.id, "Заявка сохранена. Администратор должен выдать доступ. После добавления нажмите /start.").await?;
+            } else {
+                bot.send_message(msg.chat.id, "Доступ закрыт. /start — подать заявку.").await?;
+            }
+            return Ok(());
+        };
+        let cleanup = matches!(cmd,
+            Command::Start | Command::Menu | Command::Admin | Command::Catalog
+            | Command::Search(_) | Command::Filters | Command::Subscriptions
+            | Command::Notifications | Command::Notify(_) | Command::Subscribe(_)
+            | Command::Adduser | Command::User(_) | Command::Next);
+        handle(&bot, msg.chat.id, &s, &u, cmd).await?;
+        if cleanup { panels::remove_input(&bot, msg.chat.id, msg.id, &s).await; }
+        Ok(())
+    }.await;
     if let Err(e) = result {
         tracing::warn!(error=%s.config.redact(&e.to_string()),"bot command failed");
         bot.send_message(msg.chat.id, format!("Ошибка: {}", ui::error_message(&e)))
@@ -228,16 +245,14 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         cmd,
         Command::Adduser | Command::User(_) | Command::Cancel(_)
     ) {
-        s.sessions.lock().await.entry(u.id).or_default().user_form = None;
+        panels::leave_form(bot, chat, s, u).await;
     }
     match cmd {
         Command::Start | Command::Menu => {
-            bot.send_message(chat, "FPV-каталог. Действия доступны на клавиатуре внизу чата. /menu — вернуть главное меню.")
-                .reply_markup(menu_keyboard(u.is_admin, false))
-                .await?;
+            panels::reply_menu(bot,chat,s,"FPV-каталог. Действия доступны на клавиатуре внизу чата. /menu — вернуть главное меню.",menu_keyboard(u.is_admin,false)).await?;
         }
         Command::Catalog => show_search(bot, chat, s, u).await?,
-        Command::Filters => show_filters(bot, chat).await?,
+        Command::Filters => show_filters(bot, chat, s, u).await?,
         Command::Subscriptions => show_subscriptions(bot, chat, s, u).await?,
         Command::Notifications => show_notifications(bot, chat, s, u).await?,
         Command::Adduser => {
@@ -246,8 +261,7 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         }
         Command::Admin => {
             admin(u)?;
-            bot.send_message(chat, "Управление каталогом. Выберите раздел на клавиатуре. Пользователей можно добавлять и редактировать пошагово.")
-                .reply_markup(menu_keyboard(true, true)).await?;
+            panels::reply_menu(bot,chat,s,"Управление каталогом. Выберите раздел на клавиатуре. Пользователей можно добавлять и редактировать пошагово.",menu_keyboard(true,true)).await?;
         }
         Command::Help => {
             bot.send_message(chat, "Действия доступны на клавиатуре внизу чата.
@@ -325,11 +339,14 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
                 }
             }
             let job = db::enqueue(pool, u, chat.0, &session.selection, &session.mode).await?;
-            bot.send_message(
+            finish_panel(
+                bot,
                 chat,
-                "✅ Запрос принят. Прогресс доступен через «Мои запросы».".to_string(),
+                s,
+                PanelKind::Selection,
+                "✅ Запрос принят. Прогресс доступен через «Мои запросы».",
+                job_buttons(job),
             )
-            .reply_markup(job_buttons(job))
             .await?;
         }
         Command::Jobs => {
@@ -372,9 +389,15 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
         Command::Cancel(id) => {
             if id.trim().is_empty() {
                 s.sessions.lock().await.entry(u.id).or_default().user_form = None;
-                bot.send_message(chat, "Заполнение отменено.")
-                    .reply_markup(menu_keyboard(u.is_admin, u.is_admin))
-                    .await?;
+                finish_panel(
+                    bot,
+                    chat,
+                    s,
+                    PanelKind::Form,
+                    "Заполнение отменено.",
+                    K::new(Vec::<Vec<B>>::new()),
+                )
+                .await?;
                 return Ok(());
             }
             let id = Uuid::parse_str(id.trim())?;
@@ -403,8 +426,7 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
                         .await?;
                 }
             }
-            bot.send_message(chat, "Настройки уведомлений сохранены (Москва).")
-                .await?;
+            show_notifications(bot, chat, s, u).await?;
         }
         Command::Subscribe(v) => {
             let mut ids = vec![];
@@ -433,7 +455,7 @@ async fn handle(bot: &Bot, chat: ChatId, s: &BotState, u: &User, cmd: Command) -
                 .await?;
             }
             tx.commit().await?;
-            bot.send_message(chat, "Подписки сохранены.").await?;
+            show_subscriptions(bot, chat, s, u).await?;
         }
         Command::Status => {
             admin(u)?;
@@ -656,10 +678,11 @@ async fn prepare(
     let nonce = Uuid::new_v4();
     session.nonce = Some(nonce);
     drop(sessions);
-    bot.send_message(chat,format!("Выбрано видео: {count}\nОбщий размер: {}\nСпособ: {}\n\nБольшие файлы будут доступны по ссылке Immich. Подтвердите отправку.",ui::size(bytes),ui::delivery_mode(mode))).reply_markup(K::new(vec![vec![B::callback("Подтвердить",format!("confirm:{nonce}")),B::callback("Отменить",format!("discard:{nonce}"))]])).await?;
+    show_panel(bot,chat,s,PanelKind::Selection,format!("Выбрано видео: {count}\nОбщий размер: {}\nСпособ: {}\n\nБольшие файлы будут доступны по ссылке Immich. Подтвердите отправку.",ui::size(bytes),ui::delivery_mode(mode)),K::new(vec![vec![B::callback("Подтвердить",format!("confirm:{nonce}")),B::callback("Отменить",format!("discard:{nonce}"))]])).await?;
     Ok(())
 }
 async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    panels::leave_form(bot, chat, s, u).await;
     let f = s
         .sessions
         .lock()
@@ -689,16 +712,19 @@ async fn show_search(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<
         B::callback("Все как файлы", "all:document"),
         B::callback("Immich", "all:immich"),
     ]);
-    bot.send_message(
+    show_panel(
+        bot,
         chat,
+        s,
+        PanelKind::Search,
         format!(
             "🔎 Найдено видео: {n}\nОбщий размер: {}\nСтраница {}\n\n{}",
             ui::size(bytes),
             f.page + 1,
             filter_summary(&s.pool, u, &f).await?
         ),
+        K::new(keyboard),
     )
-    .reply_markup(K::new(keyboard))
     .await?;
     Ok(())
 }
@@ -754,7 +780,6 @@ async fn show_info(bot: &Bot, chat: ChatId, s: &BotState, u: &User, id: i64) -> 
     Ok(())
 }
 async fn callback(bot: Bot, q: CallbackQuery, s: BotState) -> ResponseResult<()> {
-    bot.answer_callback_query(&q.id).await?;
     let Some(msg) = q.message.as_ref() else {
         return Ok(());
     };
@@ -772,7 +797,12 @@ async fn callback(bot: Bot, q: CallbackQuery, s: BotState) -> ResponseResult<()>
     .await;
     if let Err(e) = result {
         tracing::warn!(error=%s.config.redact(&e.to_string()), "bot action failed");
-        bot.send_message(chat, ui::error_message(&e)).await?;
+        bot.answer_callback_query(&q.id)
+            .text(ui::error_message(&e).chars().take(190).collect::<String>())
+            .show_alert(true)
+            .await?;
+    } else {
+        bot.answer_callback_query(&q.id).await?;
     }
     Ok(())
 }
@@ -808,7 +838,7 @@ async fn handle_callback(
     }
     if let Some(value) = data.strip_prefix("notify:") {
         handle(bot, chat, s, u, Command::Notify(value.into())).await?;
-        return show_notifications(bot, chat, s, u).await;
+        return Ok(());
     }
     if let Some(value) = data.strip_prefix("subscription:") {
         let id: i64 = value.parse()?;
@@ -819,7 +849,7 @@ async fn handle_callback(
         "search" => return show_search(bot, chat, s, u).await,
         "next" => return handle(bot, chat, s, u, Command::Next).await,
         "jobs" => return handle(bot, chat, s, u, Command::Jobs).await,
-        "filters" => return show_filters(bot, chat).await,
+        "filters" => return show_filters(bot, chat, s, u).await,
         "reset" => {
             s.sessions.lock().await.entry(u.id).or_default().filters = Filters::default();
             return show_search(bot, chat, s, u).await;
@@ -843,11 +873,14 @@ async fn handle_callback(
             }
         }
         let id = db::enqueue(&s.pool, u, chat.0, &selection.selection, &selection.mode).await?;
-        bot.send_message(
+        finish_panel(
+            bot,
             chat,
-            "✅ Запрос принят. Прогресс доступен через «Мои запросы».".to_string(),
+            s,
+            PanelKind::Selection,
+            "✅ Запрос принят. Прогресс доступен через «Мои запросы».",
+            job_buttons(id),
         )
-        .reply_markup(job_buttons(id))
         .await?;
     } else if let Some(nonce) = data.strip_prefix("discard:") {
         let expected = Uuid::parse_str(nonce)?;
@@ -855,7 +888,15 @@ async fn handle_callback(
             let mut sessions = s.sessions.lock().await;
             take_selection(sessions.entry(u.id).or_default(), Some(expected))?;
         }
-        bot.send_message(chat, "Выборка отменена.").await?;
+        finish_panel(
+            bot,
+            chat,
+            s,
+            PanelKind::Selection,
+            "Выборка отменена.",
+            K::new(Vec::<Vec<B>>::new()),
+        )
+        .await?;
     } else if let Some(kind) = data.strip_prefix("pick:") {
         let rows: Vec<(i64, String)> = match kind {
             "device" => sqlx::query_as("SELECT id,name FROM devices WHERE active ORDER BY id LIMIT 50").fetch_all(&s.pool).await?,
@@ -864,11 +905,21 @@ async fn handle_callback(
                 .bind(u.id).bind(u.is_admin).fetch_all(&s.pool).await?,
             _ => bail!("Неизвестный фильтр"),
         };
-        bot.send_message(chat, "Выберите значение:")
-            .reply_markup(K::new(rows.into_iter().map(|(id, name)| {
-                vec![B::callback(name, format!("set:{kind}:{id}"))]
-            })))
-            .await?;
+        panels::leave_form(bot, chat, s, u).await;
+        let mut keys = rows
+            .into_iter()
+            .map(|(id, name)| vec![B::callback(name, format!("set:{kind}:{id}"))])
+            .collect::<Vec<_>>();
+        keys.push(vec![B::callback("← Назад к фильтрам", "filters")]);
+        show_panel(
+            bot,
+            chat,
+            s,
+            PanelKind::Search,
+            "Выберите значение:",
+            K::new(keys),
+        )
+        .await?;
     } else if let Some(value) = data.strip_prefix("set:") {
         let (kind, id) = value.split_once(':').context("callback")?;
         let id: i64 = id.parse()?;
@@ -919,9 +970,9 @@ async fn handle_callback(
     }
     Ok(())
 }
-async fn show_filters(bot: &Bot, chat: ChatId) -> Result<()> {
-    bot.send_message(chat, "Выберите фильтр. Для OSD и цветокоррекции повторное нажатие переключает: любые → да → нет. Даты можно задать командой /search из помощи.")
-        .reply_markup(K::new(vec![
+async fn show_filters(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    panels::leave_form(bot, chat, s, u).await;
+    show_panel(bot,chat,s,PanelKind::Search, "Выберите фильтр. Для OSD и цветокоррекции повторное нажатие переключает: любые → да → нет. Даты можно задать командой /search из помощи.",K::new(vec![
             vec![B::callback("Аппарат", "pick:device"), B::callback("Видеосистема", "pick:system")],
             vec![B::callback("Пилот", "pick:pilot"), B::callback("OSD", "toggle:osd")],
             vec![B::callback("Цветокоррекция", "toggle:colored"), B::callback("Сбросить", "reset")],
@@ -930,6 +981,7 @@ async fn show_filters(bot: &Bot, chat: ChatId) -> Result<()> {
     Ok(())
 }
 async fn show_subscriptions(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    panels::leave_form(bot, chat, s, u).await;
     let rows: Vec<(i64,String,bool)> = sqlx::query_as("SELECT p.id,coalesce(p.nickname,p.full_name,p.telegram_username,'Пилот'),EXISTS(SELECT 1 FROM notification_subscriptions n WHERE n.user_id=$1 AND n.pilot_id=p.id) FROM users p WHERE p.active AND (p.id=$1 OR p.is_public OR $2) ORDER BY p.id LIMIT 50")
         .bind(u.id).bind(u.is_admin).fetch_all(&s.pool).await?;
     let keys = rows.into_iter().map(|(id, name, selected)| {
@@ -938,18 +990,17 @@ async fn show_subscriptions(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> 
             format!("subscription:{id}"),
         )]
     });
-    bot.send_message(chat, "Уведомления о новых видео: нажмите на пилота, чтобы включить или выключить подписку. ✅ — подписка включена. Время дайджеста настраивается через кнопку «Уведомления».")
-        .reply_markup(K::new(keys)).await?;
+    show_panel(bot,chat,s,PanelKind::Subscriptions, "Уведомления о новых видео: нажмите на пилота, чтобы включить или выключить подписку. ✅ — подписка включена. Время дайджеста настраивается через кнопку «Уведомления».",K::new(keys)).await?;
     Ok(())
 }
 async fn show_notifications(bot: &Bot, chat: ChatId, s: &BotState, u: &User) -> Result<()> {
+    panels::leave_form(bot, chat, s, u).await;
     let (enabled, time): (bool, NaiveTime) =
         sqlx::query_as("SELECT notifications_enabled,notification_time FROM users WHERE id=$1")
             .bind(u.id)
             .fetch_one(&s.pool)
             .await?;
-    bot.send_message(chat, format!("Ежедневный дайджест: {}. Время: {} по Москве. Выберите настройку ниже. Для другого времени: /notify ЧЧ:ММ.", if enabled {"включён"} else {"выключен"}, time.format("%H:%M")))
-        .reply_markup(K::new(vec![
+    show_panel(bot,chat,s,PanelKind::Notifications, format!("Ежедневный дайджест: {}. Время: {} по Москве. Выберите настройку ниже. Для другого времени: /notify ЧЧ:ММ.", if enabled {"включён"} else {"выключен"}, time.format("%H:%M")),K::new(vec![
             vec![B::callback("Включить", "notify:on"),B::callback("Выключить", "notify:off")],
             vec![B::callback("06:00", "notify:06:00"),B::callback("08:00", "notify:08:00"),B::callback("10:00", "notify:10:00")],
             vec![B::callback("12:00", "notify:12:00"),B::callback("18:00", "notify:18:00"),B::callback("21:00", "notify:21:00")],

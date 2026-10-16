@@ -30,6 +30,26 @@ fn config(root: std::path::PathBuf) -> Config {
     }
 }
 
+fn telegram_mock(capture: Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().route("/botTEST/:method", post(move |axum::extract::Path(method): axum::extract::Path<String>, Json(mut body): Json<serde_json::Value>| {
+        let mut calls = capture.lock().unwrap();
+        body["method"] = method.clone().into();
+        let id = body["message_id"].as_i64().unwrap_or(1000 + calls.len() as i64);
+        body["result_message_id"] = id.into();
+        let text = body["text"].as_str().unwrap_or("ok").to_string();
+        let chat = body["chat_id"].as_i64().unwrap_or(7777);
+        calls.push(body);
+        async move {
+            let result = match method.as_str() {
+                "SendMessage" | "EditMessageText" => serde_json::json!({"message_id":id,"date":0,"chat":{"id":chat,"type":"private"},"text":text}),
+                "DeleteMessage" | "AnswerCallbackQuery" => serde_json::json!(true),
+                _ => panic!("Unexpected Telegram call: {method}"),
+            };
+            Json(serde_json::json!({"ok":true,"result":result}))
+        }
+    }))
+}
+
 #[tokio::test]
 async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_buttons() -> Result<()>
 {
@@ -61,10 +81,7 @@ async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_butt
     let state = BotState::new(pool.clone(), Arc::new(config(temp.path().into())));
     let sent = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let capture = sent.clone();
-    let app = Router::new().route("/botTEST/SendMessage", post(move |Json(body): Json<serde_json::Value>| {
-        capture.lock().unwrap().push(body);
-        async { Json(serde_json::json!({"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":7777,"type":"private"},"text":"ok"}})) }
-    }));
+    let app = telegram_mock(capture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -133,6 +150,30 @@ async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_butt
     assert!(handle_callback(&bot, ChatId(7777), &state, &user, &save)
         .await
         .is_err());
+    let first_calls = sent.lock().unwrap().clone();
+    let created = first_calls
+        .iter()
+        .filter(|m| m["method"] == "SendMessage")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created.len(),
+        1,
+        "one message for the entire user wizard including confirmation"
+    );
+    let completed_form = created[0]["result_message_id"].clone();
+    assert!(first_calls
+        .iter()
+        .filter(|m| m["method"] == "EditMessageText")
+        .all(|m| m["message_id"] == completed_form));
+    assert_eq!(
+        first_calls
+            .iter()
+            .filter(|m| m["method"] == "DeleteMessage")
+            .count(),
+        4,
+        "only the four supplied text answers are removed"
+    );
+    let completed_at = first_calls.len();
     let added = db::user(&pool, 1004106925).await?.unwrap();
     assert!(!added.is_admin && !added.is_public);
     assert_eq!(
@@ -218,6 +259,125 @@ async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_butt
             .await?,
         2
     );
+    // Wait for background reclassification, then keep our synthetic fixture stable.
+    let mut scan_guard = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(76120301)")
+        .execute(&mut *scan_guard)
+        .await?;
+    let event: i64 =
+        sqlx::query_scalar("INSERT INTO events(name) VALUES('test_event') RETURNING id")
+            .fetch_one(&pool)
+            .await?;
+    let video: i64 = sqlx::query_scalar("INSERT INTO videos(relative_path,size_bytes,mtime_ns,event_id,pilot_id,state) VALUES('test_event/T1_N3/pilot/test.mp4',1234,1,$1,$2,'classified') RETURNING id").bind(event).bind(added.id).fetch_one(&pool).await?;
+    handle(&bot, ChatId(7777), &state, &user, Command::Catalog).await?;
+    handle(&bot, ChatId(7777), &state, &user, Command::Info(video)).await?;
+    let card = sent.lock().unwrap().last().unwrap()["result_message_id"].clone();
+    let card_at = sent.lock().unwrap().len();
+    for (id, command) in [
+        (80, Command::Filters),
+        (81, Command::Menu),
+        (82, Command::Admin),
+    ] {
+        let msg: Message = serde_json::from_value(
+            serde_json::json!({"message_id":id,"date":0,"chat":{"id":7777,"type":"private"},"from":{"id":7777,"is_bot":false,"first_name":"Admin"},"text":"navigation"}),
+        )?;
+        message(bot.clone(), msg, command, state.clone()).await?;
+        assert!(sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m["method"] == "DeleteMessage" && m["message_id"] == id));
+    }
+
+    for action in [
+        "filters",
+        "pick:device",
+        "set:device:1",
+        "next",
+        "reset",
+        "notify:10:00",
+        "notify:off",
+        "subscriptions",
+    ] {
+        handle_callback(&bot, ChatId(7777), &state, &user, action).await?;
+    }
+    let action = format!("subscription:{}", added.id);
+    handle_callback(&bot, ChatId(7777), &state, &user, &action).await?;
+    prepare(&bot, ChatId(7777), &state, &user, vec![video], "immich").await?;
+    let nonce = state.sessions.lock().await[&user.id].nonce.unwrap();
+    handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("discard:{nonce}"),
+    )
+    .await?;
+    start_user_form(&bot, ChatId(7777), &state, &user, None).await?;
+    let form = state.sessions.lock().await[&user.id]
+        .user_form
+        .clone()
+        .unwrap();
+    let draft_calls = sent.lock().unwrap().len();
+    // Invalid input stays on the same step and replaces the prompt with a helpful error.
+    let invalid: Message = serde_json::from_value(
+        serde_json::json!({"message_id":45,"date":0,"chat":{"id":7777,"type":"private"},"from":{"id":7777,"is_bot":false,"first_name":"Admin"},"text":"not-an-id"}),
+    )?;
+    free_message(bot.clone(), invalid, state.clone()).await?;
+    assert_eq!(
+        state.sessions.lock().await[&user.id]
+            .user_form
+            .as_ref()
+            .unwrap()
+            .token,
+        form.token
+    );
+    assert!(sent.lock().unwrap()[draft_calls..]
+        .iter()
+        .all(|m| m["method"] != "SendMessage"));
+    handle_callback(
+        &bot,
+        ChatId(7777),
+        &state,
+        &user,
+        &format!("uf:{}:cancel", form.token),
+    )
+    .await?;
+    let calls = sent.lock().unwrap().clone();
+    assert!(
+        calls[card_at..].iter().all(|m| m["message_id"] != card),
+        "requested video card must never be edited or deleted"
+    );
+    assert!(
+        calls[completed_at..]
+            .iter()
+            .all(|m| m["message_id"] != completed_form),
+        "confirmed user card must remain in history"
+    );
+    // All search/filter/page navigation edits the original search message.
+    let search_messages = calls
+        .iter()
+        .filter(|m| {
+            m["method"] == "SendMessage"
+                && m["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("🔎 Найдено видео")
+        })
+        .count();
+    assert_eq!(search_messages, 1);
+    let notification_messages = calls
+        .iter()
+        .filter(|m| {
+            m["method"] == "SendMessage"
+                && m["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("Ежедневный дайджест")
+        })
+        .count();
+    assert_eq!(notification_messages, 1);
+    scan_guard.rollback().await?;
     let messages = sent.lock().unwrap().clone();
     assert!(messages.iter().any(|m| m["text"]
         .as_str()
@@ -248,5 +408,114 @@ async fn interactive_user_flow_saves_only_on_confirmation_and_rejects_stale_butt
         .execute(&admin_pool)
         .await?;
     admin_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn panels_recover_deleted_controls_without_duplicating_on_transport_errors() -> Result<()> {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let failure = Arc::new(std::sync::Mutex::new(None::<(u16, String)>));
+    let log = calls.clone();
+    let fail = failure.clone();
+    let app = Router::new().route("/botTEST/:method",post(move |axum::extract::Path(method): axum::extract::Path<String>, Json(body): Json<serde_json::Value>| {
+        let mut calls = log.lock().unwrap();
+        calls.push(method.clone());
+        let problem = if method == "EditMessageText" { fail.lock().unwrap().take() } else { None };
+        let (status, result) = if let Some((status,description)) = problem {
+            (axum::http::StatusCode::from_u16(status).unwrap(),serde_json::json!({"ok":false,"error_code":status,"description":description}))
+        } else {
+            let id = body["message_id"].as_i64().unwrap_or(1000+calls.len() as i64);
+            (axum::http::StatusCode::OK,serde_json::json!({"ok":true,"result":{"message_id":id,"date":0,"chat":{"id":7777,"type":"private"},"text":body["text"]}}))
+        };
+        async move {(status,Json(result))}
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let bot = Bot::new("TEST").set_api_url(format!("http://{addr}").parse()?);
+    let temp = tempfile::tempdir()?;
+    let state = BotState::new(
+        PgPool::connect_lazy("postgres://unused:unused@127.0.0.1/unused")?,
+        Arc::new(config(temp.path().into())),
+    );
+    let chat = ChatId(7777);
+    let a = show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "First",
+        K::new(Vec::<Vec<B>>::new()),
+    );
+    let b = show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Second",
+        K::new(Vec::<Vec<B>>::new()),
+    );
+    let (a, b) = tokio::join!(a, b);
+    a?;
+    b?;
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "SendMessage")
+            .count(),
+        1
+    );
+    *failure.lock().unwrap() = Some((400, "Bad Request: message to edit not found".into()));
+    show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Recreated",
+        K::new(Vec::<Vec<B>>::new()),
+    )
+    .await?;
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "SendMessage")
+            .count(),
+        2
+    );
+    *failure.lock().unwrap()=Some((400,"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message".into()));
+    show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Recreated",
+        K::new(Vec::<Vec<B>>::new()),
+    )
+    .await?;
+    *failure.lock().unwrap() = Some((503, "Service Unavailable".into()));
+    assert!(show_panel(
+        &bot,
+        chat,
+        &state,
+        PanelKind::Search,
+        "Temporary failure",
+        K::new(Vec::<Vec<B>>::new())
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "SendMessage")
+            .count(),
+        2
+    );
+    server.abort();
     Ok(())
 }

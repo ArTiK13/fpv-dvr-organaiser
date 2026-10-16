@@ -1,9 +1,13 @@
 use super::*;
 
-pub(super) async fn show_form(bot: &Bot, chat: ChatId, form: &UserForm) -> Result<()> {
+pub(super) async fn show_form(
+    bot: &Bot,
+    chat: ChatId,
+    s: &BotState,
+    form: &UserForm,
+) -> Result<()> {
     let (text, keys) = form.view();
-    bot.send_message(chat, text).reply_markup(keys).await?;
-    Ok(())
+    show_panel(bot, chat, s, PanelKind::Form, text, keys).await
 }
 
 pub(super) async fn start_user_form(
@@ -46,8 +50,7 @@ pub(super) async fn start_user_form(
             );
         }
     }
-    bot.send_message(chat, text).reply_markup(keys).await?;
-    Ok(())
+    show_panel(bot, chat, s, PanelKind::Form, text, keys).await
 }
 
 pub(super) async fn edit_user_form(
@@ -62,7 +65,7 @@ pub(super) async fn edit_user_form(
         .bind(id).fetch_optional(&s.pool).await?.context("Пользователь не найден")?;
     let form = UserForm::prefilled(input_from_row(&row));
     s.sessions.lock().await.entry(u.id).or_default().user_form = Some(form.clone());
-    show_form(bot, chat, &form).await
+    show_form(bot, chat, s, &form).await
 }
 
 fn input_from_row(row: &sqlx::postgres::PgRow) -> db::UserInput {
@@ -109,12 +112,45 @@ pub(super) async fn free_message(bot: Bot, msg: Message, s: BotState) -> Respons
             *current = next.clone();
             next
         };
-        show_form(&bot, msg.chat.id, &form).await
+        show_form(&bot, msg.chat.id, &s, &form).await?;
+        panels::remove_input(&bot, msg.chat.id, msg.id, &s).await;
+        Ok(())
     }
     .await;
     if let Err(e) = result {
         tracing::warn!(error=%s.config.redact(&e.to_string()), "user form input failed");
-        bot.send_message(msg.chat.id, ui::error_message(&e)).await?;
+        let form = if let Some(u) = db::user(&s.pool, from.id.0 as i64)
+            .await
+            .ok()
+            .flatten()
+            .filter(|u| u.active && u.is_admin)
+        {
+            s.sessions
+                .lock()
+                .await
+                .get(&u.id)
+                .and_then(|session| session.user_form.clone())
+        } else {
+            None
+        };
+        if let Some(form) = form {
+            let (prompt, keys) = form.view();
+            if show_panel(
+                &bot,
+                msg.chat.id,
+                &s,
+                PanelKind::Form,
+                format!("{}\n\n{prompt}", ui::error_message(&e)),
+                keys,
+            )
+            .await
+            .is_ok()
+            {
+                panels::remove_input(&bot, msg.chat.id, msg.id, &s).await;
+            }
+        } else {
+            bot.send_message(msg.chat.id, ui::error_message(&e)).await?;
+        }
     }
     Ok(())
 }
@@ -141,9 +177,15 @@ pub(super) async fn user_form_callback(
         } else if action == "cancel" {
             entry.user_form = None;
             drop(sessions);
-            bot.send_message(chat, "Заполнение отменено. Изменения не сохранены.")
-                .reply_markup(menu_keyboard(true, true))
-                .await?;
+            finish_panel(
+                bot,
+                chat,
+                s,
+                PanelKind::Form,
+                "Заполнение отменено. Изменения не сохранены.",
+                K::new(Vec::<Vec<B>>::new()),
+            )
+            .await?;
             return Ok(());
         } else {
             current.action(action)?;
@@ -151,7 +193,7 @@ pub(super) async fn user_form_callback(
         }
     };
     if action != "save" {
-        return show_form(bot, chat, &form).await;
+        return show_form(bot, chat, s, &form).await;
     }
     let id = match db::save_user(
         &s.pool,
@@ -172,8 +214,11 @@ pub(super) async fn user_form_callback(
             return Err(error);
         }
     };
-    bot.send_message(
+    finish_panel(
+        bot,
         chat,
+        s,
+        PanelKind::Form,
         format!(
             "✅ Пользователь {}.\n\n{}\n\nКаталог будет проверен заново с учётом этих данных.",
             if form.input.id.is_some() {
@@ -183,8 +228,8 @@ pub(super) async fn user_form_callback(
             },
             form.summary()
         ),
+        K::new(vec![vec![B::callback("Добавить ещё", "newuser")]]),
     )
-    .reply_markup(menu_keyboard(true, true))
     .await?;
     reclassify(s);
     tracing::info!(user_id = id, "user saved from interactive form");
